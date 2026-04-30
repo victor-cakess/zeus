@@ -1,0 +1,12 @@
+[project]
+name = "zeus"
+version = "0.1.0"
+description = "Energy project"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+]
