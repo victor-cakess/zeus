@@ -8,3 +8,8 @@ logs/
 profiles.yml  
 .env
 CLAUDE.md
+terraform.tfvars
+*.secrets.tfvars
+.terraform/
+*.tfstate
+*.tfstate.*
