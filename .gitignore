@@ -17,6 +17,8 @@ profiles.yml
 *.tfstate.*
 terraform.tfvars
 *.secrets.tfvars
+infra/modules/aws/**/build/
+infra/modules/aws/build/
 
 # Data / pipelines
 extraction/
@@ -25,3 +27,6 @@ extraction/
 .env
 .claude/
 CLAUDE.md
+decisions.md
+temp_decisions
+snowflake.md
