@@ -1,15 +1,27 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+.ruff_cache/
+
+# dbt
 .dbt/
 target/
 dbt_packages/
 logs/
-profiles.yml  
-.env
-CLAUDE.md
-terraform.tfvars
-*.secrets.tfvars
+profiles.yml
+
+# Terraform
 .terraform/
 *.tfstate
 *.tfstate.*
+terraform.tfvars
+*.secrets.tfvars
+
+# Data / pipelines
+extraction/
+
+# Secrets & local config
+.env
+.claude/
+CLAUDE.md

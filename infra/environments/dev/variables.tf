@@ -36,3 +36,15 @@ variable "warehouse_size" {
   description = "Size of the Snowflake warehouse."
   default     = "x-small"
 }
+
+variable "aws_region" {
+  type        = string
+  description = "AWS region for data infrastructure."
+  default     = "sa-east-1"
+}
+
+variable "data_bucket_name" {
+  type        = string
+  description = "Name of the S3 data bucket."
+  default     = "s3-energy-data-bucket"
+}
