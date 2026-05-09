@@ -41,3 +41,23 @@ resource "aws_cloudwatch_event_target" "daily" {
     respondents = local.balancing_authorities
   })
 }
+
+resource "aws_cloudwatch_event_rule" "sfn_failure" {
+  name        = "${local.prefix}-eia-sfn-failure"
+  description = "Fires when the EIA Step Function execution fails, times out, or is aborted."
+
+  event_pattern = jsonencode({
+    source      = ["aws.states"]
+    detail-type = ["Step Functions Execution Status Change"]
+    detail = {
+      status         = ["FAILED", "TIMED_OUT", "ABORTED"]
+      stateMachineArn = [aws_sfn_state_machine.this.arn]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "sfn_failure" {
+  rule      = aws_cloudwatch_event_rule.sfn_failure.name
+  target_id = "eia-sfn-failure-sns"
+  arn       = data.terraform_remote_state.core.outputs.alerts_topic_arn
+}
