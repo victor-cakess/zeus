@@ -1,5 +1,5 @@
 resource "aws_iam_role" "sfn" {
-  name = "zeus-eia-sfn"
+  name = "${local.prefix}-eia-sfn"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -12,7 +12,7 @@ resource "aws_iam_role" "sfn" {
 }
 
 resource "aws_iam_role_policy" "sfn" {
-  name = "zeus-eia-sfn"
+  name = "${local.prefix}-eia-sfn"
   role = aws_iam_role.sfn.id
 
   policy = jsonencode({
@@ -26,7 +26,7 @@ resource "aws_iam_role_policy" "sfn" {
 }
 
 resource "aws_sfn_state_machine" "this" {
-  name     = "zeus-eia-daily"
+  name     = local.sfn_name
   role_arn = aws_iam_role.sfn.arn
   type     = "STANDARD"
 

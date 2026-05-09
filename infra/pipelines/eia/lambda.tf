@@ -1,8 +1,3 @@
-locals {
-  lambda_src_dir   = "${path.module}/../../../../../src/lambdas/eia"
-  lambda_build_dir = "${path.module}/../../build/eia"
-}
-
 resource "null_resource" "lambda_deps" {
   triggers = {
     requirements = filemd5("${local.lambda_src_dir}/requirements.txt")
@@ -30,7 +25,7 @@ data "archive_file" "this" {
 }
 
 resource "aws_iam_role" "lambda" {
-  name = "zeus-eia-lambda"
+  name = "${local.prefix}-eia-lambda"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -48,7 +43,7 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
 }
 
 resource "aws_iam_role_policy" "lambda" {
-  name = "zeus-eia-lambda"
+  name = "${local.prefix}-eia-lambda"
   role = aws_iam_role.lambda.id
 
   policy = jsonencode({
@@ -57,7 +52,7 @@ resource "aws_iam_role_policy" "lambda" {
       {
         Effect   = "Allow"
         Action   = "s3:PutObject"
-        Resource = "${var.bucket_arn}/raw/eia/*"
+        Resource = "${data.aws_s3_bucket.data.arn}/raw/eia/*"
       },
       {
         Effect   = "Allow"
@@ -79,7 +74,7 @@ resource "aws_iam_role_policy" "lambda" {
 }
 
 resource "aws_lambda_function" "this" {
-  function_name    = "zeus-eia-extract"
+  function_name    = local.lambda_name
   role             = aws_iam_role.lambda.arn
   filename         = data.archive_file.this.output_path
   source_code_hash = data.archive_file.this.output_base64sha256
@@ -90,8 +85,8 @@ resource "aws_lambda_function" "this" {
 
   environment {
     variables = {
-      BUCKET               = var.bucket_name
-      EIA_API_KEY_SSM_PATH = aws_ssm_parameter.api_key.name
+      BUCKET               = data.aws_s3_bucket.data.id
+      EIA_API_KEY_SSM_PATH = local.ssm_key_path
       LOOKBACK_DAYS        = tostring(var.lookback_days)
     }
   }

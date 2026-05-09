@@ -1,5 +1,5 @@
 resource "aws_iam_role" "eventbridge" {
-  name = "zeus-eia-eventbridge"
+  name = "${local.prefix}-eia-eventbridge"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -12,7 +12,7 @@ resource "aws_iam_role" "eventbridge" {
 }
 
 resource "aws_iam_role_policy" "eventbridge" {
-  name = "zeus-eia-eventbridge"
+  name = "${local.prefix}-eia-eventbridge"
   role = aws_iam_role.eventbridge.id
 
   policy = jsonencode({
@@ -26,7 +26,7 @@ resource "aws_iam_role_policy" "eventbridge" {
 }
 
 resource "aws_cloudwatch_event_rule" "daily" {
-  name                = "zeus-eia-daily"
+  name                = local.eb_rule_name
   description         = "Daily trigger for EIA ingestion Step Function."
   schedule_expression = var.schedule_cron
 }

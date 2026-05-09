@@ -17,6 +17,7 @@ profiles.yml
 *.tfstate.*
 terraform.tfvars
 *.secrets.tfvars
+infra/build/
 infra/modules/aws/**/build/
 infra/modules/aws/build/
 
