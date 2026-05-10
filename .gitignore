@@ -28,6 +28,6 @@ extraction/
 .env
 .claude/
 CLAUDE.md
-decisions.md
+ADR.md
 temp_decisions
 snowflake.md
