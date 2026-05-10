@@ -34,3 +34,8 @@ variable "warehouse_size" {
   type    = string
   default = "x-small"
 }
+
+variable "alert_email" {
+  type        = string
+  description = "Email address to receive pipeline failure alerts."
+}

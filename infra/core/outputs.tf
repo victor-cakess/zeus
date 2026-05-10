@@ -9,3 +9,7 @@ output "bucket_arn" {
 output "snowflake_warehouse_name" {
   value = snowflake_warehouse.this.name
 }
+
+output "alerts_topic_arn" {
+  value = aws_sns_topic.alerts.arn
+}
