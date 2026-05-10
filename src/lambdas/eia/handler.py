@@ -73,6 +73,9 @@ def lambda_handler(event: dict, context) -> dict:
 
     rows = fetch_ba(ba, start, end)
 
+    if not rows:
+        raise ValueError(f"no data returned for respondent '{ba}' ({start} to {end})")
+
     key = (
         "raw/eia/"
         f"ingestion_year={today.year:04d}/"

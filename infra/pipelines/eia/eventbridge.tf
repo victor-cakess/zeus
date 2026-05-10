@@ -60,4 +60,14 @@ resource "aws_cloudwatch_event_target" "sfn_failure" {
   rule      = aws_cloudwatch_event_rule.sfn_failure.name
   target_id = "eia-sfn-failure-sns"
   arn       = data.terraform_remote_state.core.outputs.alerts_topic_arn
+
+  input_transformer {
+    input_paths = {
+      execution = "$.detail.executionArn"
+      status    = "$.detail.status"
+      started   = "$.detail.startDate"
+      stopped   = "$.detail.stopDate"
+    }
+    input_template = "\"EIA pipeline <status>\\n\\nExecution: <execution>\\nStarted:   <started>\\nStopped:   <stopped>\\n\\nFor failure details, run:\\n  aws stepfunctions describe-execution --execution-arn <execution>\""
+  }
 }
