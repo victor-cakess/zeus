@@ -12,8 +12,12 @@ locals {
   bucket_name = "${local.prefix}-energy-data"
 
   # Paths relative to this root (infra/pipelines/eia/)
-  lambda_src_dir   = "${path.module}/../../../src/lambdas/eia"
-  lambda_build_dir = "${path.module}/../../build/eia"
+  lambda_src_dir   = "${path.module}/../../../src/lambdas/eia/extract"
+  lambda_build_dir = "${path.module}/../../build/eia_extract"
+
+  lambda_consolidate_name      = "${local.prefix}-eia-transform"
+  lambda_consolidate_src_dir   = "${path.module}/../../../src/lambdas/eia/transform"
+  lambda_consolidate_build_dir = "${path.module}/../../build/eia_transform"
 
   balancing_authorities = [
     "EPE", "SRP", "MIDA", "NW", "AVRN", "NWMT", "PSCO", "TEN", "SW", "WALC",

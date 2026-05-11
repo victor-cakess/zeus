@@ -19,7 +19,7 @@ resource "null_resource" "lambda_deps" {
 data "archive_file" "this" {
   type        = "zip"
   source_dir  = local.lambda_build_dir
-  output_path = "${path.module}/../../build/eia.zip"
+  output_path = "${path.module}/../../build/eia_extract.zip"
 
   depends_on = [null_resource.lambda_deps]
 }
@@ -88,6 +88,100 @@ resource "aws_lambda_function" "this" {
       BUCKET               = data.aws_s3_bucket.data.id
       EIA_API_KEY_SSM_PATH = local.ssm_key_path
       LOOKBACK_DAYS        = tostring(var.lookback_days)
+    }
+  }
+}
+
+# --- Transform Lambda ---
+
+resource "null_resource" "lambda_transform_deps" {
+  triggers = {
+    requirements = filemd5("${local.lambda_consolidate_src_dir}/requirements.txt")
+    handler      = filemd5("${local.lambda_consolidate_src_dir}/handler.py")
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -e
+      unset VIRTUAL_ENV
+      rm -rf ${local.lambda_consolidate_build_dir}
+      mkdir -p ${local.lambda_consolidate_build_dir}
+      uv pip install --quiet --python python3.12 --target ${local.lambda_consolidate_build_dir} -r ${local.lambda_consolidate_src_dir}/requirements.txt
+      cp ${local.lambda_consolidate_src_dir}/handler.py ${local.lambda_consolidate_build_dir}/
+    EOT
+  }
+}
+
+data "archive_file" "transform" {
+  type        = "zip"
+  source_dir  = local.lambda_consolidate_build_dir
+  output_path = "${path.module}/../../build/eia_transform.zip"
+
+  depends_on = [null_resource.lambda_transform_deps]
+}
+
+resource "aws_iam_role" "lambda_transform" {
+  name = "${local.prefix}-eia-transform-lambda"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_transform_basic" {
+  role       = aws_iam_role.lambda_transform.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy" "lambda_transform" {
+  name = "${local.prefix}-eia-transform-lambda"
+  role = aws_iam_role.lambda_transform.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = data.aws_s3_bucket.data.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = ["raw/eia/*"]
+          }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${data.aws_s3_bucket.data.arn}/raw/eia/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${data.aws_s3_bucket.data.arn}/curated/eia/*"
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_function" "transform" {
+  function_name    = local.lambda_consolidate_name
+  role             = aws_iam_role.lambda_transform.arn
+  filename         = data.archive_file.transform.output_path
+  source_code_hash = data.archive_file.transform.output_base64sha256
+  handler          = "handler.lambda_handler"
+  runtime          = "python3.12"
+  memory_size      = 512
+  timeout          = 300
+
+  environment {
+    variables = {
+      BUCKET = data.aws_s3_bucket.data.id
     }
   }
 }
