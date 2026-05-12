@@ -1,5 +1,9 @@
+locals {
+  sfn_name = "${var.prefix}-${var.source_name}-daily"
+}
+
 resource "aws_iam_role" "sfn" {
-  name = "${local.prefix}-eia-sfn"
+  name = "${var.prefix}-${var.source_name}-sfn"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -12,17 +16,17 @@ resource "aws_iam_role" "sfn" {
 }
 
 resource "aws_iam_role_policy" "sfn" {
-  name = "${local.prefix}-eia-sfn"
+  name = "${var.prefix}-${var.source_name}-sfn"
   role = aws_iam_role.sfn.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = "lambda:InvokeFunction"
+      Effect = "Allow"
+      Action = "lambda:InvokeFunction"
       Resource = [
-        aws_lambda_function.this.arn,
-        aws_lambda_function.transform.arn,
+        module.extract.function_arn,
+        module.transform.function_arn,
       ]
     }]
   })
@@ -34,24 +38,24 @@ resource "aws_sfn_state_machine" "this" {
   type     = "STANDARD"
 
   definition = jsonencode({
-    Comment = "Fan out one EIA Lambda invocation per balancing authority, then consolidate to Parquet."
+    Comment = "Fan out one ${var.source_name} extract per unit, then consolidate to Parquet."
     StartAt = "FanOut"
     States = {
       FanOut = {
         Type           = "Map"
-        ItemsPath      = "$.respondents"
-        MaxConcurrency = 20
+        ItemsPath      = "$.units"
+        MaxConcurrency = var.max_concurrency
         ItemProcessor = {
           ProcessorConfig = { Mode = "INLINE" }
-          StartAt         = "InvokeEIA"
+          StartAt         = "InvokeExtract"
           States = {
-            InvokeEIA = {
+            InvokeExtract = {
               Type     = "Task"
               Resource = "arn:aws:states:::lambda:invoke"
               Parameters = {
-                FunctionName = aws_lambda_function.this.arn
+                FunctionName = module.extract.function_arn
                 Payload = {
-                  "respondent.$" = "$"
+                  "unit.$" = "$"
                 }
               }
               Retry = [{
@@ -70,7 +74,7 @@ resource "aws_sfn_state_machine" "this" {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.transform.arn
+          FunctionName = module.transform.function_arn
           Payload      = {}
         }
         Retry = [{

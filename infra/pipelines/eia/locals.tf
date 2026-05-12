@@ -1,23 +1,6 @@
 locals {
   project = "zeus"
   env     = "dev"
-  prefix  = "${local.project}-${local.env}"
-
-  lambda_name  = "${local.prefix}-eia-extract"
-  sfn_name     = "${local.prefix}-eia-daily"
-  eb_rule_name = "${local.prefix}-eia-daily"
-  ssm_key_path = "/${local.project}/${local.env}/eia/api_key"
-
-  # Must mirror the naming convention in infra/core/locals.tf
-  bucket_name = "${local.prefix}-energy-data"
-
-  # Paths relative to this root (infra/pipelines/eia/)
-  lambda_src_dir   = "${path.module}/../../../src/lambdas/eia/extract"
-  lambda_build_dir = "${path.module}/../../build/eia_extract"
-
-  lambda_consolidate_name      = "${local.prefix}-eia-transform"
-  lambda_consolidate_src_dir   = "${path.module}/../../../src/lambdas/eia/transform"
-  lambda_consolidate_build_dir = "${path.module}/../../build/eia_transform"
 
   balancing_authorities = [
     "EPE", "SRP", "MIDA", "NW", "AVRN", "NWMT", "PSCO", "TEN", "SW", "WALC",
