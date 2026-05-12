@@ -67,27 +67,33 @@ Each pipeline discovers shared resources via data sources and `terraform_remote_
 
 ---
 
-## 3. S3 layout: source-first prefix, multi-level Hive partitioning
+## 3. S3 layout: two-layer architecture, source-first prefix, multi-level Hive partitioning
 
-**Chosen:** Single shared bucket `${prefix}-energy-data`. Each source gets its own top-level prefix (`raw/<source>/`); within that, multi-level Hive partitioning on ingestion date; filename = `<unit>.json`.
+**Chosen:** Single shared bucket `${prefix}-energy-data` with two layers:
+- **Raw layer** (`raw/<source>/`): one JSON file per atomic unit, immutable, append-only.
+- **Curated layer** (`curated/<source>/`): one Snappy-compressed Parquet per day, produced by the transform stage after the fan-out completes.
 
 ```
 s3://zeus-dev-energy-data/raw/<source>/ingestion_year=YYYY/ingestion_month=MM/ingestion_day=DD/<unit>.json
+s3://zeus-dev-energy-data/curated/<source>/ingestion_year=YYYY/ingestion_month=MM/ingestion_day=DD/<source>_grid.parquet
 ```
 
 **Why:**
 - **Source-first prefix** so each source gets its own Snowflake stage, Snowpipe, IAM scope, and lifecycle policy without cross-source coupling.
 - **Multi-level Hive partitioning on date** keeps S3-console browsability healthy as the bucket grows. Flat date folders would become 1,825 sibling entries per source over 5 years; multi-level keeps every depth ≤ 30.
 - **No `<unit>=` partition.** The unit is in the JSON payload and in the filename. The path partition bought no query pruning (Snowpipe → raw table, not external table) and just added a directory level.
-- **Filename = `<unit>.json`** keeps per-unit traceability for debugging without polluting the path.
-- **Append-only, immutable.** Bucket is the source of truth; downstream de-dup happens at query time in Snowflake (`qualify row_number() over (...) = 1`), not at write time.
+- **Filename = `<unit>.json`** (raw) / `<source>_grid.parquet` (curated) keeps per-unit traceability for debugging without polluting the path.
+- **Two-layer separation** keeps raw JSON as the immutable source of truth; the curated Parquet is a derived, typed artifact. Re-running the transform never touches raw.
+- **Append-only, immutable.** Downstream de-dup happens at query time in Snowflake (`qualify row_number() over (...) = 1`), not at write time.
 
 **Alternatives considered:**
 - **Date-first prefix** (`raw/ingestion_date=.../<source>/...`) — better for "what did we ingest on day X" cross-source listings but worse for per-source IAM, lifecycle, and Snowpipe scoping.
 - **Flat `ingestion_date=YYYY-MM-DD/`** — fewer levels but degraded console browsability over time.
+- **Single layer (raw JSON only, transform in Snowflake)** — skip the curated Parquet; Snowpipe loads raw JSON, dbt handles typing. Rejected: a typed Parquet external stage is cheaper and faster to query; also keeps S3 → Snowflake coupling simpler.
 
 **Trade-offs:**
 - Downstream needs to know to de-dup. Owned by the dbt staging model.
+- Curated layer is a derived artifact — if the transform schema changes, old curated partitions are not backfilled automatically.
 
 ---
 
@@ -330,6 +336,27 @@ The first production pipeline. Pulls hourly fuel-type data from EIA Form-930 for
 
 **Trade-offs:**
 - If EIA begins publishing data for one of these BAs in the future, it will go unnoticed until the list is manually updated.
+
+---
+
+### EIA-8. Consolidation stage: dedicated transform Lambda (post-fan-out)
+
+**Chosen:** A separate `zeus-dev-eia-transform` Lambda, invoked once in a `Consolidate` state after the `Map` fan-out completes. It reads all raw JSON files for the day's partition, consolidates them into a single Snappy-compressed Parquet, and writes to `curated/eia/`.
+
+**Alternatives considered:**
+- **Write Parquet directly in each extract Lambda** — each BA writes its own Parquet shard. Rejected: 71 separate Parquet files per day in the curated layer, instead of one; Snowflake external stage + Snowpipe works best against a single file per partition.
+- **Consolidate in Snowflake only** — skip the curated layer; Snowpipe loads raw JSON, dbt handles typing and consolidation. Rejected: a pre-typed Parquet curated layer is cheaper and faster to query from Snowflake external stage; also preserves the curated layer as a reusable artifact independent of Snowflake.
+- **Post-Map consolidation inside the fan-out iterator** — not possible; each `Map` iteration is independent and cannot coordinate writes to a shared object.
+
+**Why:**
+- `Map` → `Consolidate` is a natural Step Functions pattern: wait for all parallel branches to land, then run one pass over the results.
+- A single Parquet per day is the natural landing target for a Snowflake external stage + Snowpipe.
+- Keeping raw and curated separate preserves the raw layer as the immutable source of truth; re-running the transform never modifies raw files.
+- The transform Lambda's empty-rows guard (`ValueError` if no raw files found or all empty) means a silent failure in the fan-out is caught before the curated layer is overwritten.
+
+**Trade-offs:**
+- Two Lambda deployments per pipeline instead of one (separate source dirs, separate build artifacts, separate IAM role).
+- Transform Lambda requires `s3:ListBucket` + `s3:GetObject` on `raw/eia/*` and `s3:PutObject` on `curated/eia/*`.
 
 ---
 
