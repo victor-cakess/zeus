@@ -27,43 +27,43 @@ Format per entry: the decision, alternatives considered, why the chosen option w
 
 ---
 
-## 2. Terraform structure: decoupled multi-state roots
+## 2. Terraform structure: decoupled multi-state roots over shared modules
 
-**Chosen:** Two independent Terraform state roots. Long-lived shared infrastructure in `infra/core/`; each pipeline is its own root under `infra/pipelines/<source>/`.
+**Chosen:** Two independent Terraform state roots. Long-lived shared infrastructure in `infra/core/`; each pipeline is its own root under `infra/pipelines/<source>/`, instantiating shared modules from `infra/modules/`.
 
 ```
 infra/
   core/
-    backend.tf, providers.tf, variables.tf, locals.tf, main.tf, outputs.tf, sns.tf
+    backend.tf, providers.tf, variables.tf, locals.tf, main.tf, sns.tf, outputs.tf
+  modules/
+    lambda_job/    # one Lambda + role + ZIP packaging
+    pipeline/      # composes lambda_job × 2 + SFN + EventBridge + SSM + failure alert
   pipelines/
     eia/
       backend.tf, providers.tf, variables.tf, locals.tf
-      data.tf, ssm.tf, lambda.tf, step_function.tf, eventbridge.tf, sns.tf, outputs.tf
-    noaa/    # future — zero changes to core
-    fred/    # future
-    epa/     # future
-  build/     # gitignored Lambda zip artifacts
+      remote_state.tf, main.tf, outputs.tf
+    noaa/, fred/, epa/   # future — same shape, all call modules/pipeline
+  build/                 # gitignored Lambda zip artifacts
 ```
 
-Each pipeline discovers shared resources via data sources and `terraform_remote_state`:
-- Shared S3 bucket via `data "aws_s3_bucket"` (name derived from `${prefix}-energy-data` convention).
-- Shared SNS alerts topic via `terraform_remote_state` against `infra/core` state.
+Each pipeline root consumes `infra/core` outputs (`bucket_name`, `bucket_arn`, `alerts_topic_arn`) via `data "terraform_remote_state" "core"` and passes them as inputs to `modules/pipeline`. No naming-convention re-derivation across roots.
 
-**Naming convention:** `${project}-${env}-<source>-<resource>` (e.g. `zeus-dev-eia-extract`). SSM paths: `/${project}/${env}/<source>/api_key`. Defined via locals in each root.
+**Naming convention:** `${project}-${env}-<source>-<resource>` (e.g. `zeus-dev-eia-extract`). SSM paths: `/${project}/${env}/<source>/api_key`. The `pipeline` module derives all resource names from `var.source_name` + `var.prefix`.
 
 **Alternatives considered:**
 - **Single nested-module hierarchy** (`environments/dev → modules/aws → modules/aws/sources/eia`). Every new source required editing `modules/aws/main.tf` and `modules/aws/outputs.tf`; outputs bubbled through two module layers; one bad apply could affect all shared and pipeline resources in the same plan.
 - **Per-resource-type submodules** (`modules/aws/lambdas/`, `modules/aws/step_functions/`). Splits a single pipeline across multiple folders; ownership harder to follow.
+- **Single TF root for all pipelines with `for_each` over a map** — collapses to one apply for everything. Rejected: couples deploys of unrelated sources; one bad apply could disturb every running pipeline.
 
-**Why decoupled roots won:**
+**Why decoupled roots with shared modules won:**
 - **Blast radius.** A broken pipeline apply cannot touch the S3 bucket, Snowflake warehouse, or SNS topic — they are in separate state.
 - **True isolation.** Each pipeline is planned and applied independently.
-- **Zero-touch onboarding.** New source = new directory under `infra/pipelines/`. `infra/core/` is never modified for a new pipeline.
-- **No output bubbling.** Outputs live exactly where the resource lives.
+- **Zero-touch onboarding.** New source = new thin root under `infra/pipelines/` calling `modules/pipeline`. `infra/core/` is never modified for a new pipeline.
+- **One place to change cross-pipeline mechanics.** Lambda runtime, retry policy, IAM scoping, packaging — all live in the modules and propagate to every pipeline on next apply.
 
 **Trade-offs:**
-- `project` and `env` locals are duplicated across roots. Acceptable at current scale; a shared variable file or `terraform_remote_state` lookup becomes worthwhile around 5+ pipeline roots.
-- The `null_resource` Lambda build pattern is copy-pasted per pipeline. A shared module eliminates this at ~3+ pipelines.
+- `project` and `env` locals are duplicated across pipeline roots. Acceptable at current scale; a shared variable file becomes worthwhile around 5+ pipeline roots.
+- Module changes require a `terraform apply` against every pipeline root to propagate.
 
 ---
 
@@ -215,6 +215,58 @@ s3://zeus-dev-energy-data/curated/<source>/ingestion_year=YYYY/ingestion_month=M
 **When wired:**
 - `snowflake_storage_integration` (account-level, shared) → `infra/core/`.
 - `snowflake_stage` + `snowflake_pipe` (per-source) → each `infra/pipelines/<source>/`.
+
+---
+
+## 11. Terraform module composition: `lambda_job` + `pipeline`
+
+**Chosen:** Two-tier modules under `infra/modules/`:
+- **`lambda_job/`** packages one Lambda: `null_resource` build (uv pip install + copy handler files + copy `src/shared/`) → `archive_file` → IAM role with basic exec + caller-supplied inline policy → `aws_lambda_function`. Source/build dirs and policy statements are inputs.
+- **`pipeline/`** composes `lambda_job × 2` (named slots `extract` + `transform`) plus the Step Function (FanOut → Consolidate), EventBridge daily rule, SSM SecureString, and the failure-alert rule wired to the shared SNS topic.
+
+Each pipeline root is then a thin composition: `locals` for the source-specific units list, one `module "pipeline" { source = "../../modules/pipeline" … }` block.
+
+**Alternatives considered:**
+- **Per-pipeline inline resources** (the previous shape). Every new source duplicated the Lambda + IAM + SFN + EB + SSM stack. The `lambda.tf` alone was ~190 lines and grew linearly per Lambda.
+- **One module per resource type** (`modules/lambda/`, `modules/sfn/`, `modules/eventbridge/`). Forces each pipeline root to wire the pieces together. Each new source repeats the wiring; module-level changes don't propagate to the integration.
+- **One module instantiated via `for_each` over a pipelines map** (single TF state for all pipelines). Maximum scale-up ease — adding a source is one map entry — but couples deploys and forces apply to touch every pipeline.
+
+**Why two-tier composition won:**
+- New source = copy `infra/pipelines/eia/`, edit `locals.tf` (units list) and `main.tf` (module inputs: schedule, src dirs). No infrastructure code written.
+- Mechanics changes (Lambda runtime, retry policy, tags) land in one module file and propagate.
+- IAM least-privilege policies are derived from `var.source_name` inside the module — `raw/<source>/*` and `curated/<source>/*` ARN patterns are constructed per source automatically.
+- `lambda_job` is reusable on its own for any future single-Lambda need (not just within a pipeline).
+
+**Trade-offs:**
+- The `pipeline` module hard-codes the two-stage fan-out → consolidate shape. A future source needing three stages (e.g. extract → enrich → transform) will need a separate `pipeline_3stage/` module rather than flags on the existing one. This is intentional — don't pre-generalize.
+- Module changes don't auto-deploy; each pipeline root must be re-applied for the change to land.
+
+---
+
+## 12. Cross-Lambda Python helpers in `src/shared/`
+
+**Chosen:** A `src/shared/` package vendored into every Lambda's build dir at the zip root. Modules:
+- `paths.py` — single source of truth for the S3 layout (`raw_key`, `raw_prefix`, `curated_prefix`).
+- `s3_io.py` — boto3 wrappers (`put_json`, `put_bytes`, `list_keys`, `iter_json_objects`).
+- `ssm.py` — module-cached `get_parameter`.
+- `time_window.py` — `today_utc()` and `lookback_window(today, days)`.
+
+Handlers import as `from shared import paths, s3_io, ssm, time_window`. The build step in `modules/lambda_job/` copies `src/shared/` into `${build_dir}/shared` and fingerprints `**/*.py` under both `var.src_dir` and `var.shared_dir` in `null_resource.triggers`, so any edit forces a rebuild.
+
+**Alternatives considered:**
+- **Lambda Layer** attached to every function. Rejected at 1–4 pipelines: another infra resource to manage, layer version bumps required across functions, and the per-zip size savings are negligible at our deps footprint.
+- **Vendored copy per Lambda dir** — duplicate `paths.py` etc. into every `src/lambdas/<source>/<stage>/`. Defeats the point.
+- **No shared library; each handler re-implements** the S3 layout and SSM caching. Re-derives the same logic in N places — exactly the problem this refactor was made to solve.
+
+**Why a copied package won:**
+- One edit to `src/shared/paths.py` propagates to every Lambda zip via the build fingerprint.
+- Handlers shrink to ~25 lines of orchestration; source-specific logic lives in `src/lambdas/<source>/<stage>/{client,schema}.py`.
+- No new AWS infrastructure required (vs Lambda Layer).
+- The Lambda zip is self-contained — no version skew between a Layer and its consumers.
+
+**Trade-offs:**
+- A change in `src/shared/` rebuilds every Lambda zip on next `terraform apply`, even when only one Lambda actually exercises the changed function. Acceptable; zips are small and rebuilds are local.
+- Build step has two parallel copy operations (`find … cp --parents` for the Lambda dir, `cp -r` for `shared/`). The shared-side copy isn't filtered to `*.py`, so `__pycache__` from local dev imports can leak into the zip if not cleaned up between builds.
 
 ---
 
