@@ -1,6 +1,6 @@
 # Architectural Decisions Records
 
-Design decisions for the Zeus data platform — a multi-source energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability) are at the top of this document. Pipeline-specific decisions are grouped under their own sections below.
+Design decisions for the Zeus data platform, a multi-source energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability) are at the top of this document. Pipeline-specific decisions are grouped under their own sections below.
 
 Format per entry: the decision, alternatives considered, why the chosen option won, and known trade-offs.
 
@@ -56,7 +56,7 @@ Each pipeline root consumes `infra/core` outputs (`bucket_name`, `bucket_arn`, `
 - **Single TF root for all pipelines with `for_each` over a map** — collapses to one apply for everything. Rejected: couples deploys of unrelated sources; one bad apply could disturb every running pipeline.
 
 **Why decoupled roots with shared modules won:**
-- **Blast radius.** A broken pipeline apply cannot touch the S3 bucket, Snowflake warehouse, or SNS topic — they are in separate state.
+- **Blast radius.** A broken pipeline apply cannot touch the S3 bucket, Snowflake warehouse, or SNS topic, they are in separate state.
 - **True isolation.** Each pipeline is planned and applied independently.
 - **Zero-touch onboarding.** New source = new thin root under `infra/pipelines/` calling `modules/pipeline`. `infra/core/` is never modified for a new pipeline.
 - **One place to change cross-pipeline mechanics.** Lambda runtime, retry policy, IAM scoping, packaging — all live in the modules and propagate to every pipeline on next apply.
@@ -93,7 +93,7 @@ s3://zeus-dev-energy-data/curated/<source>/ingestion_year=YYYY/ingestion_month=M
 
 **Trade-offs:**
 - Downstream needs to know to de-dup. Owned by the dbt staging model.
-- Curated layer is a derived artifact — if the transform schema changes, old curated partitions are not backfilled automatically.
+- Curated layer is a derived artifact: if the transform schema changes, old curated partitions are not backfilled automatically.
 
 ---
 
