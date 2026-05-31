@@ -11,9 +11,10 @@ resource "null_resource" "build" {
       unset VIRTUAL_ENV
       rm -rf ${var.build_dir}
       mkdir -p ${var.build_dir}
-      uv pip install --quiet --python python3.12 --target ${var.build_dir} -r ${var.src_dir}/requirements.txt
-      (cd ${var.src_dir} && find . -name '*.py' -type f -exec cp --parents '{}' ${var.build_dir}/ \;)
-      cp -r ${var.shared_dir} ${var.build_dir}/shared
+      BUILD_DIR="$(cd ${var.build_dir} && pwd)"
+      uv pip install --quiet --python python3.12 --target "$BUILD_DIR" -r ${var.src_dir}/requirements.txt
+      (cd ${var.src_dir} && find . -name '*.py' -type f -exec cp --parents '{}' "$BUILD_DIR/" \;)
+      cp -r ${var.shared_dir} "$BUILD_DIR/shared"
     EOT
   }
 }

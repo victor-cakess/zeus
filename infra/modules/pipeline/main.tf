@@ -5,6 +5,7 @@ locals {
 
   raw_arn_pattern     = "${var.bucket_arn}/raw/${var.source_name}/*"
   curated_arn_pattern = "${var.bucket_arn}/curated/${var.source_name}/*"
+  reports_arn_pattern = "${var.bucket_arn}/reports/${var.source_name}/*"
 
   common_env = {
     BUCKET = var.bucket_name
@@ -59,7 +60,10 @@ module "transform" {
   build_dir  = "${var.build_root}/${local.transform_name}"
   zip_path   = "${var.build_root}/${local.transform_name}.zip"
 
-  env_vars = local.common_env
+  env_vars = merge(local.common_env, {
+    SNS_TOPIC_ARN     = var.alerts_topic_arn
+    SKIP_HISTORY_DAYS = "30"
+  })
 
   policy_statements = [
     {
@@ -68,19 +72,24 @@ module "transform" {
       Resource = var.bucket_arn
       Condition = {
         StringLike = {
-          "s3:prefix" = ["raw/${var.source_name}/*"]
+          "s3:prefix" = ["raw/${var.source_name}/*", "reports/${var.source_name}/*"]
         }
       }
     },
     {
       Effect   = "Allow"
       Action   = "s3:GetObject"
-      Resource = local.raw_arn_pattern
+      Resource = [local.raw_arn_pattern, local.reports_arn_pattern]
     },
     {
       Effect   = "Allow"
       Action   = "s3:PutObject"
-      Resource = local.curated_arn_pattern
+      Resource = [local.curated_arn_pattern, local.reports_arn_pattern]
+    },
+    {
+      Effect   = "Allow"
+      Action   = "sns:Publish"
+      Resource = var.alerts_topic_arn
     },
   ]
 }
