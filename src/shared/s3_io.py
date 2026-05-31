@@ -27,7 +27,12 @@ def list_keys(bucket: str, prefix: str) -> list[str]:
     return keys
 
 
-def iter_json_objects(bucket: str, prefix: str) -> Iterator[dict]:
+def get_json(bucket: str, key: str):
+    body = _s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    return json.loads(body)
+
+
+def iter_objects(bucket: str, prefix: str) -> Iterator:
+    """Yield each object's parsed JSON as-is. The caller owns the file's shape."""
     for key in list_keys(bucket, prefix):
-        body = _s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-        yield from json.loads(body)
+        yield get_json(bucket, key)

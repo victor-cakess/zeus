@@ -247,7 +247,7 @@ Each pipeline root is then a thin composition: `locals` for the source-specific 
 
 **Chosen:** A `src/shared/` package vendored into every Lambda's build dir at the zip root. Modules:
 - `paths.py` — single source of truth for the S3 layout (`raw_key`, `raw_prefix`, `curated_prefix`).
-- `s3_io.py` — boto3 wrappers (`put_json`, `put_bytes`, `list_keys`, `iter_json_objects`).
+- `s3_io.py` — boto3 wrappers (`put_json`, `put_bytes`, `get_json`, `list_keys`, `iter_objects`).
 - `ssm.py` — module-cached `get_parameter`.
 - `time_window.py` — `today_utc()` and `lookback_window(today, days)`.
 
@@ -267,6 +267,30 @@ Handlers import as `from shared import paths, s3_io, ssm, time_window`. The buil
 **Trade-offs:**
 - A change in `src/shared/` rebuilds every Lambda zip on next `terraform apply`, even when only one Lambda actually exercises the changed function. Acceptable; zips are small and rebuilds are local.
 - Build step has two parallel copy operations (`find … cp --parents` for the Lambda dir, `cp -r` for `shared/`). The shared-side copy isn't filtered to `*.py`, so `__pycache__` from local dev imports can leak into the zip if not cleaned up between builds.
+
+---
+
+## 13. Shared helpers are source-agnostic (raw shape owned by the caller)
+
+**Chosen:** Everything in `src/shared/` takes the source name as a parameter and never assumes a source's payload shape. Raw S3 reads go through `iter_objects(bucket, prefix)`, which yields each file's parsed JSON **as-is**; the calling pipeline owns the file's shape. EIA's transform — whose raw files are flat JSON arrays of rows — flattens at the call site:
+
+```python
+rows = [normalize_row(r, today)
+        for obj in s3_io.iter_objects(BUCKET, prefix)
+        for r in obj]
+```
+
+**Alternatives considered:**
+- **A flattening reader in `src/shared/`** (the previous `iter_json_objects`, which did `yield from json.loads(body)`). Worked for EIA but baked EIA's "raw file is a flat array of rows" assumption into shared code. Rejected: NOAA/FRED/EPA may write a JSON object or an envelope (`{"results": [...]}`), which would raise `TypeError` or silently iterate dict keys the first time a new pipeline reused the shared reader.
+- **A `shape=` flag on the shared reader** to switch between flatten/no-flatten. Rejected: pushes per-source branching into the shared layer; the call site is the natural owner of that one-liner.
+
+**Why caller-owned shape won:**
+- The next pipeline reuses `src/shared/` unchanged — no latent runtime break inherited from EIA.
+- The raw-shape decision lives next to the source-specific `schema.py`/`normalize_row`, where a new pipeline's author is already working.
+- `src/shared/` stays a thin, assumption-free boundary: path construction, S3 IO, SSM, SNS, time math — each parameterized by `source`.
+
+**Trade-offs:**
+- Each pipeline writes its own one-line flatten (or none). Negligible duplication, and it makes the per-source shape explicit rather than hidden in a shared helper.
 
 ---
 

@@ -45,6 +45,9 @@ resource "aws_sfn_state_machine" "this" {
         Type           = "Map"
         ItemsPath      = "$.units"
         MaxConcurrency = var.max_concurrency
+        ItemSelector = {
+          "unit.$" = "$$.Map.Item.Value"
+        }
         ItemProcessor = {
           ProcessorConfig = { Mode = "INLINE" }
           StartAt         = "InvokeExtract"
@@ -55,8 +58,13 @@ resource "aws_sfn_state_machine" "this" {
               Parameters = {
                 FunctionName = module.extract.function_arn
                 Payload = {
-                  "unit.$" = "$"
+                  "unit.$" = "$.unit"
                 }
+              }
+              ResultSelector = {
+                "unit.$" = "$.Payload.unit"
+                "rows.$" = "$.Payload.rows"
+                "status" = "ok"
               }
               Retry = [{
                 ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
@@ -64,6 +72,20 @@ resource "aws_sfn_state_machine" "this" {
                 MaxAttempts     = 2
                 BackoffRate     = 2.0
               }]
+              Catch = [{
+                ErrorEquals = ["States.ALL"]
+                ResultPath  = "$.errorInfo"
+                Next        = "RecordSkip"
+              }]
+              End = true
+            }
+            RecordSkip = {
+              Type = "Pass"
+              Parameters = {
+                "unit.$"  = "$.unit"
+                "status"  = "skipped"
+                "error.$" = "$.errorInfo.Cause"
+              }
               End = true
             }
           }
@@ -75,7 +97,9 @@ resource "aws_sfn_state_machine" "this" {
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
           FunctionName = module.transform.function_arn
-          Payload      = {}
+          Payload = {
+            "results.$" = "$"
+          }
         }
         Retry = [{
           ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
