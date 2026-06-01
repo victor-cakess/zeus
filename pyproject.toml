@@ -11,5 +11,6 @@ dev = [
     "boto3>=1.43.6",
     "pre-commit>=4.6.0",
     "pyarrow>=24.0.0",
+    "requests>=2.32.3",
     "ruff>=0.15.12",
 ]
