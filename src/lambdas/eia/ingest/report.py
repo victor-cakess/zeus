@@ -1,23 +1,10 @@
-import json
 from collections import Counter
 from datetime import date
 
 
 def _reason(error) -> str:
-    """Pull a readable message out of the Step Function `Cause`.
-
-    For Lambda failures the Cause is a JSON string carrying `errorMessage`;
-    fall back to the raw value for anything else.
-    """
-    if not error:
-        return "unknown"
-    try:
-        parsed = json.loads(error)
-        if isinstance(parsed, dict) and "errorMessage" in parsed:
-            return parsed["errorMessage"]
-    except (ValueError, TypeError):
-        pass
-    return str(error)
+    """Return a readable skip reason from a per-BA error (a plain string)."""
+    return str(error) if error else "unknown"
 
 
 def build_run_report(d: date, rows: int, results: list[dict]) -> dict:

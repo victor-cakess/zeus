@@ -1,9 +1,9 @@
-"""Put the repo's src/ and the EIA Lambda dirs on sys.path so the backfill
+"""Put the repo's src/ and the EIA Lambda dir on sys.path so the backfill
 scripts can reuse the production code unchanged:
 
     from shared import paths, s3_io   # src/shared/
-    import client                     # src/lambdas/eia/extract/client.py
-    import schema                     # src/lambdas/eia/transform/schema.py
+    import client                     # src/lambdas/eia/ingest/client.py
+    import schema                     # src/lambdas/eia/ingest/schema.py
 
 Import this module (for its side effect) before importing any of the above.
 """
@@ -15,8 +15,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _PATHS = [
     _REPO_ROOT / "src",
-    _REPO_ROOT / "src" / "lambdas" / "eia" / "extract",
-    _REPO_ROOT / "src" / "lambdas" / "eia" / "transform",
+    _REPO_ROOT / "src" / "lambdas" / "eia" / "ingest",
 ]
 
 for _p in _PATHS:
