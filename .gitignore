@@ -27,7 +27,6 @@ extraction/
 # Secrets & local config
 .env
 .claude/
-CLAUDE.md
 ADR.md
 temp_decisions
 snowflake.md
