@@ -45,6 +45,12 @@ def format_email(
         f"Succeeded: {n_ok} | Skipped: {n_skip}",
     ]
 
+    sf = run_report.get("snowflake")
+    if sf and sf["status"] == "ok":
+        lines.append(f"Snowflake: loaded {sf['rows_loaded']} rows")
+    elif sf:
+        lines.append(f"Snowflake: FAILED — {sf['error']}")
+
     if run_report["skipped"]:
         lines.append("")
         lines.append("Skipped this run:")

@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 import report
 from client import fetch_unit
 from schema import SCHEMA, normalize_row
-from shared import paths, s3_io, sns, ssm, time_window
+from shared import paths, s3_io, snowflake_io, sns, ssm, time_window
 
 BUCKET = os.environ["BUCKET"]
 SOURCE = os.environ["SOURCE"]
@@ -17,6 +17,16 @@ SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
 SKIP_HISTORY_DAYS = int(os.environ.get("SKIP_HISTORY_DAYS", "30"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "20"))
+
+SNOWFLAKE_ACCOUNT = os.environ["SNOWFLAKE_ACCOUNT"]
+SNOWFLAKE_USER = os.environ["SNOWFLAKE_USER"]
+SNOWFLAKE_ROLE = os.environ["SNOWFLAKE_ROLE"]
+SNOWFLAKE_WAREHOUSE = os.environ["SNOWFLAKE_WAREHOUSE"]
+SNOWFLAKE_DATABASE = os.environ["SNOWFLAKE_DATABASE"]
+SNOWFLAKE_SCHEMA = os.environ["SNOWFLAKE_SCHEMA"]
+SNOWFLAKE_TABLE = os.environ["SNOWFLAKE_TABLE"]
+SNOWFLAKE_STAGE = os.environ["SNOWFLAKE_STAGE"]
+SNOWFLAKE_KEY_SSM_PATH = os.environ["SNOWFLAKE_PRIVATE_KEY_SSM_PATH"]
 
 
 def _date_from_report_key(key: str) -> date:
@@ -38,6 +48,33 @@ def _load_skip_history(today: date) -> dict[str, int]:
     ]
     reports = [s3_io.get_json(BUCKET, k) for k in keys]
     return report.skip_history(reports)
+
+
+def _load_snowflake(today: date) -> int:
+    """COPY the day's curated Parquet into Snowflake. Snowflake reads the file
+    from S3 via the stage's storage integration; we only submit the statement.
+    Targets just today's partition — the stage's load metadata makes re-runs of
+    the same file a no-op. Returns rows loaded."""
+    stage_root = f"curated/{SOURCE}/"
+    day_path = paths.curated_prefix(SOURCE, today)[len(stage_root):]
+    statement = (
+        f"COPY INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE} "
+        f"FROM @{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_STAGE}/{day_path} "
+        # USE_LOGICAL_TYPE = TRUE makes Snowflake honor the Parquet TIMESTAMP
+        # logical type (µs); without it `period` loads as a raw INT64 → Invalid date.
+        f"FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE) "
+        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE"
+    )
+    return snowflake_io.copy_into(
+        account=SNOWFLAKE_ACCOUNT,
+        user=SNOWFLAKE_USER,
+        private_key_pem=ssm.get_parameter(SNOWFLAKE_KEY_SSM_PATH),
+        role=SNOWFLAKE_ROLE,
+        warehouse=SNOWFLAKE_WAREHOUSE,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA,
+        statement=statement,
+    )
 
 
 def _fetch_one(unit: str, start: str, end: str, api_key: str, today: date) -> dict:
@@ -78,15 +115,24 @@ def lambda_handler(event, context) -> dict:
     ]
 
     out_key = paths.curated_prefix(SOURCE, today) + f"{SOURCE}_grid.parquet"
+    snowflake_load = None
     if rows:
         table = pa.Table.from_pylist(rows, schema=SCHEMA)
         buf = BytesIO()
         pq.write_table(table, buf, compression="snappy")
         s3_io.put_bytes(BUCKET, out_key, buf.getvalue())
 
+        # Load the day's Parquet into Snowflake. A failure here must not swallow
+        # the run-report email, so capture it and re-raise after emailing.
+        try:
+            snowflake_load = {"status": "ok", "rows_loaded": _load_snowflake(today), "error": None}
+        except Exception as e:  # noqa: BLE001 — surfaced in the report, re-raised below
+            snowflake_load = {"status": "error", "rows_loaded": 0, "error": str(e)}
+
     # Write this run's report, then email the summary — the final step of the
     # run, before any hard-fail below.
     run_report = report.build_run_report(today, len(rows), results)
+    run_report["snowflake"] = snowflake_load
     s3_io.put_json(BUCKET, paths.report_key(SOURCE, today), run_report)
 
     history = _load_skip_history(today)
@@ -98,9 +144,16 @@ def lambda_handler(event, context) -> dict:
     if not rows:
         raise ValueError(f"no rows under {prefix}")
 
+    # Consolidation succeeded but the Snowflake load failed: the curated Parquet
+    # is safe in S3 (re-runnable; load metadata skips already-loaded files). Raise
+    # so the on-failure destination alerts.
+    if snowflake_load["status"] == "error":
+        raise RuntimeError(f"snowflake load failed: {snowflake_load['error']}")
+
     return {
         "rows": len(rows),
         "key": out_key,
         "succeeded": len(run_report["succeeded"]),
         "skipped": len(run_report["skipped"]),
+        "snowflake_rows_loaded": snowflake_load["rows_loaded"],
     }

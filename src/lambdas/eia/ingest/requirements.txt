@@ -1,2 +1,8 @@
 requests==2.32.3
 pyarrow==19.0.1
+snowflake-connector-python==3.12.3
+# Pin the pyOpenSSL/cryptography pair: snowflake-connector's loose bounds let the
+# resolver pick pyOpenSSL 22 + cryptography 46, which crashes at import
+# (X509_V_FLAG_NOTIFY_POLICY was removed in cryptography 42). This pair is compatible.
+cryptography==43.0.3
+pyOpenSSL==24.2.1
