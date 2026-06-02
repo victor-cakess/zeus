@@ -1,15 +1,7 @@
-output "extract_function_name" {
-  value = module.pipeline.extract_function_name
-}
-
-output "transform_function_name" {
-  value = module.pipeline.transform_function_name
-}
-
-output "state_machine_arn" {
-  value = module.pipeline.state_machine_arn
+output "ingest_function_name" {
+  value = module.ingest.function_name
 }
 
 output "api_key_ssm_path" {
-  value = module.pipeline.api_key_ssm_path
+  value = aws_ssm_parameter.api_key.name
 }

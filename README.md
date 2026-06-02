@@ -1,6 +1,8 @@
-# Architectural Decisions Records
+# Architectural Decision Records
 
-Design decisions for the Zeus data platform, a multi-source energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability) are at the top of this document. Pipeline-specific decisions are grouped under their own sections below.
+Design decisions for the Zeus data platform — an energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) are at the top of this document. EIA-specific decisions are grouped in their own section below.
+
+The platform currently runs one production pipeline (EIA hourly fuel-type ingestion) and has a provisioned Snowflake warehouse.
 
 Format per entry: the decision, alternatives considered, why the chosen option won, and known trade-offs.
 
@@ -13,98 +15,95 @@ Format per entry: the decision, alternatives considered, why the chosen option w
 **Chosen:** `sa-east-1`.
 
 **Alternatives:**
-- `us-west-2` (Oregon) — co-locate with Snowflake account.
 - `us-east-1` (N. Virginia) — cheapest AWS region.
+- `us-west-2` (Oregon).
 
 **Why:**
 - Matches the pre-existing Terraform state backend (`zeus-analytics-tfstate` is in `sa-east-1`). Splitting infra across regions adds operational complexity.
 - Local development is in Brazil; lower latency for CLI-driven tests and console use.
-- Snowflake (Oregon) reads cross-region from S3 fine — a Snowflake storage integration handles it transparently.
 
 **Trade-offs:**
-- Snowflake-side reads cross paid AWS data-transfer ($0.02/GB out of `sa-east-1`). At current volumes, cost is negligible.
-- Slight read latency for Snowflake (cross-region), invisible at our row volumes.
+- Not the cheapest region; the cost delta is negligible at current volumes.
 
 ---
 
-## 2. Terraform structure: decoupled multi-state roots over shared modules
+## 2. Terraform structure: decoupled multi-state roots + a shared packaging module
 
-**Chosen:** Two independent Terraform state roots. Long-lived shared infrastructure in `infra/core/`; each pipeline is its own root under `infra/pipelines/<source>/`, instantiating shared modules from `infra/modules/`.
+**Chosen:** Independent Terraform state roots. Long-lived shared infrastructure lives in `infra/core/`; the pipeline is its own root under `infra/pipelines/eia/`, instantiating the shared `infra/modules/lambda_job/` module and authoring the rest of its resources directly.
 
 ```
 infra/
-  core/
+  core/                 # shared S3 bucket + SNS alerts topic + Snowflake warehouse
     backend.tf, providers.tf, variables.tf, locals.tf, main.tf, sns.tf, outputs.tf
   modules/
-    lambda_job/    # one Lambda + role + ZIP packaging
-    pipeline/      # composes lambda_job × 2 + SFN + EventBridge + SSM + failure alert
+    lambda_job/         # one Lambda + IAM role + ZIP packaging (the only shared module)
   pipelines/
     eia/
       backend.tf, providers.tf, variables.tf, locals.tf
-      remote_state.tf, main.tf, outputs.tf
-    noaa/, fred/, epa/   # future — same shape, all call modules/pipeline
-  build/                 # gitignored Lambda zip artifacts
+      remote_state.tf   # consumes infra/core outputs
+      main.tf           # SSM param + lambda_job + EventBridge rule + on-failure config
+      outputs.tf
+  build/                # gitignored Lambda zip artifacts
 ```
 
-Each pipeline root consumes `infra/core` outputs (`bucket_name`, `bucket_arn`, `alerts_topic_arn`) via `data "terraform_remote_state" "core"` and passes them as inputs to `modules/pipeline`. No naming-convention re-derivation across roots.
+The pipeline root consumes `infra/core` outputs (`bucket_name`, `bucket_arn`, `alerts_topic_arn`) via `data "terraform_remote_state" "core"` and passes them as inputs.
 
-**Naming convention:** `${project}-${env}-<source>-<resource>` (e.g. `zeus-dev-eia-extract`). SSM paths: `/${project}/${env}/<source>/api_key`. The `pipeline` module derives all resource names from `var.source_name` + `var.prefix`.
+**Naming convention:** `${project}-${env}-<source>-<resource>` (e.g. `zeus-dev-eia-ingest`). SSM paths: `/${project}/${env}/<source>/api_key`. Names are derived in the pipeline root from `local.prefix` + the source name.
 
 **Alternatives considered:**
-- **Single nested-module hierarchy** (`environments/dev → modules/aws → modules/aws/sources/eia`). Every new source required editing `modules/aws/main.tf` and `modules/aws/outputs.tf`; outputs bubbled through two module layers; one bad apply could affect all shared and pipeline resources in the same plan.
-- **Per-resource-type submodules** (`modules/aws/lambdas/`, `modules/aws/step_functions/`). Splits a single pipeline across multiple folders; ownership harder to follow.
-- **Single TF root for all pipelines with `for_each` over a map** — collapses to one apply for everything. Rejected: couples deploys of unrelated sources; one bad apply could disturb every running pipeline.
+- **Single nested-module hierarchy** (`environments/dev → modules/aws → modules/aws/sources/eia`). Outputs bubble through two module layers; one bad apply could affect all shared and pipeline resources in the same plan.
+- **Single TF root for everything** — collapses to one apply. Rejected: couples deploys of shared infra and pipeline resources; one bad apply could disturb the bucket, warehouse, and SNS topic.
 
-**Why decoupled roots with shared modules won:**
-- **Blast radius.** A broken pipeline apply cannot touch the S3 bucket, Snowflake warehouse, or SNS topic, they are in separate state.
-- **True isolation.** Each pipeline is planned and applied independently.
-- **Zero-touch onboarding.** New source = new thin root under `infra/pipelines/` calling `modules/pipeline`. `infra/core/` is never modified for a new pipeline.
-- **One place to change cross-pipeline mechanics.** Lambda runtime, retry policy, IAM scoping, packaging — all live in the modules and propagate to every pipeline on next apply.
+**Why decoupled roots won:**
+- **Blast radius.** A broken pipeline apply cannot touch the S3 bucket, Snowflake warehouse, or SNS topic — they live in separate state.
+- **True isolation.** The pipeline is planned and applied independently of shared infra.
+- **One place for cross-cutting mechanics.** Lambda packaging and IAM live in `modules/lambda_job/` and propagate on apply.
 
 **Trade-offs:**
-- `project` and `env` locals are duplicated across pipeline roots. Acceptable at current scale; a shared variable file becomes worthwhile around 5+ pipeline roots.
-- Module changes require a `terraform apply` against every pipeline root to propagate.
+- `project` and `env` locals are duplicated between `infra/core/` and the pipeline root. Acceptable at this scale.
 
 ---
 
 ## 3. S3 layout: two-layer architecture, source-first prefix, multi-level Hive partitioning
 
-**Chosen:** Single shared bucket `${prefix}-energy-data` with two layers:
+**Chosen:** Single shared bucket `${prefix}-energy-data` with two data layers plus a reports prefix:
 - **Raw layer** (`raw/<source>/`): one JSON file per atomic unit, immutable, append-only.
-- **Curated layer** (`curated/<source>/`): one Snappy-compressed Parquet per day, produced by the transform stage after the fan-out completes.
+- **Curated layer** (`curated/<source>/`): one Snappy-compressed Parquet per day, produced after the fan-out completes.
+- **Reports** (`reports/<source>/`): one JSON run report per run.
 
 ```
 s3://zeus-dev-energy-data/raw/<source>/ingestion_year=YYYY/ingestion_month=MM/ingestion_day=DD/<unit>.json
 s3://zeus-dev-energy-data/curated/<source>/ingestion_year=YYYY/ingestion_month=MM/ingestion_day=DD/<source>_grid.parquet
+s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=MM/ingestion_day=DD/run_report.json
 ```
 
 **Why:**
-- **Source-first prefix** so each source gets its own Snowflake stage, Snowpipe, IAM scope, and lifecycle policy without cross-source coupling.
-- **Multi-level Hive partitioning on date** keeps S3-console browsability healthy as the bucket grows. Flat date folders would become 1,825 sibling entries per source over 5 years; multi-level keeps every depth ≤ 30.
-- **No `<unit>=` partition.** The unit is in the JSON payload and in the filename. The path partition bought no query pruning (Snowpipe → raw table, not external table) and just added a directory level.
+- **Source-first prefix** so each source has its own IAM scope and lifecycle boundary without cross-source coupling.
+- **Multi-level Hive partitioning on date** keeps S3-console browsability healthy as the bucket grows. Flat date folders would become ~1,825 sibling entries per source over 5 years; multi-level keeps every depth small.
+- **No `<unit>=` partition.** The unit is in the JSON payload and in the filename; a path partition would add a directory level and buy no query pruning.
 - **Filename = `<unit>.json`** (raw) / `<source>_grid.parquet` (curated) keeps per-unit traceability for debugging without polluting the path.
-- **Two-layer separation** keeps raw JSON as the immutable source of truth; the curated Parquet is a derived, typed artifact. Re-running the transform never touches raw.
-- **Append-only, immutable.** Downstream de-dup happens at query time in Snowflake (`qualify row_number() over (...) = 1`), not at write time.
+- **Two-layer separation** keeps raw JSON as the immutable source of truth; the curated Parquet is a derived, typed artifact. Re-running the consolidation never touches raw.
+- **Append-only, immutable.** Downstream de-dup happens at query time (`qualify row_number() over (partition by (period, respondent, fueltype) order by ingestion_date desc) = 1`), not at write time.
 
 **Alternatives considered:**
-- **Date-first prefix** (`raw/ingestion_date=.../<source>/...`) — better for "what did we ingest on day X" cross-source listings but worse for per-source IAM, lifecycle, and Snowpipe scoping.
+- **Date-first prefix** (`raw/ingestion_date=.../<source>/...`) — better for cross-source "what did we ingest on day X" listings but worse for per-source IAM and lifecycle scoping.
 - **Flat `ingestion_date=YYYY-MM-DD/`** — fewer levels but degraded console browsability over time.
-- **Single layer (raw JSON only, transform in Snowflake)** — skip the curated Parquet; Snowpipe loads raw JSON, dbt handles typing. Rejected: a typed Parquet external stage is cheaper and faster to query; also keeps S3 → Snowflake coupling simpler.
+- **Single raw layer only** — skip the curated Parquet. Rejected: a pre-typed Parquet is cheaper and faster to query, and the curated layer is a reusable typed artifact in its own right.
 
 **Trade-offs:**
-- Downstream needs to know to de-dup. Owned by the dbt staging model.
-- Curated layer is a derived artifact: if the transform schema changes, old curated partitions are not backfilled automatically.
+- Downstream must know to de-dup. That responsibility sits with whatever queries the curated/raw data.
+- The curated layer is derived: a schema change does not retroactively rewrite old curated partitions.
 
 ---
 
-## 4. Source code layout: `src/lambdas/<name>/`
+## 4. Source code layout: `src/lambdas/<source>/ingest/`
 
-**Chosen:** `src/lambdas/<lambda-name>/handler.py` + `requirements.txt`.
+**Chosen:** `src/lambdas/<source>/ingest/handler.py` + sibling modules + `requirements.txt`.
 
 **Why:**
 - `src/` is the conventional Python project root (visible to type checkers, IDE indexers, and packaging tools).
-- Reusable: `src/lambdas/eia/`, `src/lambdas/noaa/`, `src/lambdas/fred/`, `src/lambdas/epa/` follow the same pattern.
-- Keeps Lambda source out of `extraction/` (which is gitignored — a source-of-truth lambda must be in git).
+- A single `ingest/` stage holds the whole pipeline's code: `handler.py` (orchestration) plus `client.py`, `schema.py`, `report.py`.
+- Keeps Lambda source out of `extraction/` (gitignored notebooks) — a source-of-truth Lambda must be in git.
 
 ---
 
@@ -113,166 +112,145 @@ s3://zeus-dev-energy-data/curated/<source>/ingestion_year=YYYY/ingestion_month=M
 **Chosen:** SSM Parameter Store, `SecureString`, AWS-managed KMS key (`alias/aws/ssm`).
 
 **Alternatives:**
-- **AWS Secrets Manager** — supports automatic rotation, $0.40/secret/month + $0.05/10k API calls.
-- **Lambda environment variable** (encrypted with KMS) — simpler but couples secret rotation to redeploy.
+- **AWS Secrets Manager** — supports automatic rotation, $0.40/secret/month + API charges.
+- **Lambda environment variable** (KMS-encrypted) — simpler but couples secret rotation to redeploy.
 
 **Why SSM won:**
 - Free tier (Standard parameters).
-- Single static API key per source with no automatic rotation requirement.
-- IAM scoping is one-line in the Lambda role.
+- A single static API key with no automatic-rotation requirement.
+- IAM scoping is one line in the Lambda role.
 - KMS decrypt cost is part of the SSM `GetParameter` price (free).
 
 **Trade-offs:**
-- No automatic rotation. If we ever need it, migration to Secrets Manager is one resource swap.
+- No automatic rotation. If it's ever needed, migration to Secrets Manager is one resource swap.
 - Standard parameter limit of 4 KB / version — fine for an API key.
 
-**Performance:** First `ssm.get_parameter` call adds 10–30 ms cold-start latency. Cached at module scope, so warm invocations don't re-fetch.
+**Performance:** First `ssm.get_parameter` call adds 10–30 ms latency. The result is cached at module scope, and the handler fetches the key once before the thread pool starts so warm invocations and concurrent workers don't re-fetch.
 
 ---
 
 ## 6. Secret value handling: `lifecycle.ignore_changes = [value]`
 
-**Chosen:** Terraform creates the SSM parameter with placeholder `"PLACEHOLDER_SET_VIA_CLI"`, ignores future value changes; real value is set out-of-band via `aws ssm put-parameter`.
+**Chosen:** Terraform creates the SSM parameter with placeholder `"PLACEHOLDER_SET_VIA_CLI"` and ignores future value changes; the real value is set out-of-band via `aws ssm put-parameter`.
 
 **Alternatives:**
 - Pass the secret as a Terraform variable (`TF_VAR_*_api_key`) into the parameter's `value`.
 
 **Why:**
-- Keeps the plaintext API key out of Terraform state. Even with state encrypted at rest in S3, anyone with read access to state could see it.
-- Lets us rotate the key with a single CLI command, no `terraform apply` needed.
+- Keeps the plaintext API key out of Terraform state. Even with state encrypted at rest, anyone with read access to state could otherwise see it.
+- The key rotates with a single CLI command — no `terraform apply` needed.
 
 **Trade-offs:**
-- The first apply leaves an invalid placeholder in SSM until the manual `put-parameter` step. Easy to forget — captured in the runbook.
+- The first apply leaves an invalid placeholder in SSM until the manual `put-parameter` step. Captured in the runbook (`CLAUDE.md`).
 
 ---
 
 ## 7. Lambda packaging: ZIP via `archive_file` + `null_resource`
 
-**Chosen:** Local `uv pip install --target` builds deps, `archive_file` zips, Lambda references the zip directly.
+**Chosen:** A local `uv pip install --target` builds deps, `archive_file` zips, and the Lambda references the zip directly.
 
 **Alternatives:**
 - **Container image (ECR)** — Docker build pushed to ECR; Lambda pulls the image.
 - **Lambda layer** for dependencies, source as a separate ZIP.
 
 **Why ZIP won:**
-- Total package size 2 MB (just `requests` + transitive deps). No 250 MB pressure.
-- Cold start with ZIP: 500 ms–1 s. Container would be 1–3 s.
-- No Docker/ECR moving parts.
+- No Docker/ECR moving parts; the build is a local `uv` invocation.
+- The zip is self-contained — no version skew between a layer and its consumers.
+- Stays well under the 250 MB unzipped limit (the ingest package is ~44 MB zipped, dominated by `pyarrow`).
 
 **Trade-offs:**
-- `null_resource` runs `uv pip install` on the operator's machine; relies on Python 3.12 + uv being installed. If a future dep needs C extensions for Linux ABI, we'd need to switch to container or build inside Docker.
+- `null_resource` runs `uv pip install` on the operator's machine; it relies on `uv` + Python 3.12 being on PATH. If a future dep needs a different Linux ABI, we'd switch to a container or Docker build.
+- `pyarrow` makes the zip large (~44 MB) and adds ~1.2 s of cold-start init. Acceptable for a once-daily batch job.
 
 **Detour worth recording:**
-- Initial command was `python3 -m pip install --target …` — failed because the project's `.venv` is uv-managed and pip-less, but `VIRTUAL_ENV` was set so `python3` resolved to the pip-less venv interpreter.
-- Fix: `unset VIRTUAL_ENV` + `uv pip install --python python3.12 --target …`. Independent of any active venv.
+- An initial `python3 -m pip install --target …` failed because the project's `.venv` is uv-managed and pip-less, but `VIRTUAL_ENV` was set so `python3` resolved to the pip-less venv interpreter.
+- Fix: `unset VIRTUAL_ENV` + `uv pip install --python python3.12 --target …`, independent of any active venv.
 
 ---
 
-## 8. Step Function workflow type: `STANDARD` (default)
+## 8. Observability: run-report email + Lambda on-failure destination (shared SNS topic)
 
-**Chosen:** `STANDARD` workflow as the default for all pipeline orchestration.
-
-**Alternatives:** `EXPRESS` workflows.
-
-**Why:**
-- Daily batch with auditability requirement — Standard keeps execution history for 1 year, viewable in console.
-- Express is cheaper and faster for high-volume request/response traffic (≥1k/s) — irrelevant at one execution/day.
-- Cost difference at our volume: pennies/month either way.
-
-**Trade-offs:**
-- Standard $25/M state transitions; Express $1/M + duration billing. At our volume both are negligible.
-
----
-
-## 9. Observability: EventBridge → SNS email alerting (shared topic)
-
-**Chosen:** Shared SNS topic `zeus-dev-alerts` in `infra/core/`. Each pipeline adds an EventBridge rule on Step Functions Execution Status Change (`FAILED`, `TIMED_OUT`, `ABORTED`) targeting the shared topic. Input transformer formats a human-readable message with execution ARN, status, and timestamps.
+**Chosen:** A shared SNS topic `zeus-dev-alerts` in `infra/core/`, fed by two paths from the ingest Lambda:
+1. **Run-report email** — on every completed run the Lambda publishes a formatted summary: succeeded/skipped counts, per-skip reasons, and a 30-day skip-frequency history (built by reading recent run reports from the reports layer).
+2. **Failure alert** — the Lambda's asynchronous **on-failure destination** points at the topic. EventBridge invokes the Lambda asynchronously with `maximum_retry_attempts = 0`, so any unhandled crash (OOM, timeout, init error) or the total-outage `ValueError` routes the failed invocation record to the topic.
 
 **Alternatives considered:**
-- **Per-pipeline SNS topic** — simpler to stamp out but creates N subscriptions and N confirmation emails. Shared topic wins: one subscription, all pipelines route failures to the same inbox.
-- **CloudWatch Alarms on `ExecutionsFailed` metric** — reactive but has a minimum 1-minute evaluation window and doesn't carry execution context in the notification.
-- **Lambda formatter between EventBridge and SNS** — full control over subject and body, can call `describe-execution` to include failure cause inline. Rejected as over-engineering for current scale; logged as tech debt.
+- **EventBridge rule on a Step Functions execution-status change** — the previous approach, which depended on an orchestrator that no longer exists. Removed with the move to a single Lambda.
+- **CloudWatch alarm on the Lambda `Errors` metric** — also catches every crash mode, but carries no run context in the notification and needs threshold/period tuning. The on-failure destination delivers the failed event directly with zero added configuration.
+- **Per-pipeline SNS topic** — creates an extra subscription and confirmation email per pipeline. The shared topic routes everything to one inbox.
 
 **Why:**
-- EventBridge directly targets SNS with no added Lambda — zero new runtime surface area.
-- Shared topic means new pipelines only need an EventBridge rule + target; no changes to `infra/core/` and no new subscription confirmation.
-- `FAILED`/`TIMED_OUT`/`ABORTED` covers all terminal failure states for Standard workflows.
+- The run-report email is the day-to-day signal: it always fires and carries the per-BA outcome (which is the operationally useful detail).
+- The on-failure destination is the safety net for crashes that happen *before* the Lambda can publish its own report. It's a single `aws_lambda_function_event_invoke_config` resource.
+- The shared topic means the pipeline only needs `sns:Publish` permission and the destination wiring — no changes to `infra/core/`.
 
 **Trade-offs:**
-- `$.detail.cause` is not present in the Step Functions Execution Status Change event (only available via `describe-execution`); the alert body therefore does not include the failure reason inline. The execution ARN in the email is sufficient to retrieve it with one CLI call.
-- Input transformer silently fails to deliver if a referenced JSON path is absent — learned by testing; `cause` path was removed from the transformer for this reason.
+- The on-failure alert is the raw Lambda async-destination envelope (JSON), not a hand-formatted message. The formatted, human-readable summary comes from the run-report email; the destination envelope is the fallback for hard crashes.
+- `maximum_retry_attempts = 0` means a transient platform error fails the run rather than auto-retrying. The daily schedule and the 7-day rolling lookback make the next run self-healing, and per-BA HTTP errors are already retried inside the Lambda.
 
 ---
 
-## 10. Snowflake integration: deferred separate scope
+## 9. Snowflake warehouse: `ZEUS_DEV_WH`
 
-**Decision:** AWS-only ingestion this round. Storage integration / external stage / Snowpipe / raw table / dbt model are a separate plan once data lands in S3.
+**Chosen:** A single `snowflake_warehouse` in `infra/core/` — `x-small`, auto-suspend 60 minutes, auto-resume.
 
 **Why:**
-- Cleaner reviews — one moving target at a time.
-- Snowflake side has its own cross-region IAM trust setup (different account, different region) that warrants focused design.
+- `x-small` is the smallest, cheapest warehouse size; auto-suspend/auto-resume means it only bills while a query runs.
+- It lives in `infra/core/` because a warehouse is account-level shared infrastructure, not pipeline-specific.
 
-**When wired:**
-- `snowflake_storage_integration` (account-level, shared) → `infra/core/`.
-- `snowflake_stage` + `snowflake_pipe` (per-source) → each `infra/pipelines/<source>/`.
+**Trade-offs:**
+- It is provisioned but not connected to S3.
 
 ---
 
-## 11. Terraform module composition: `lambda_job` + `pipeline`
+## 10. Terraform module: a single reusable `lambda_job`
 
-**Chosen:** Two-tier modules under `infra/modules/`:
-- **`lambda_job/`** packages one Lambda: `null_resource` build (uv pip install + copy handler files + copy `src/shared/`) → `archive_file` → IAM role with basic exec + caller-supplied inline policy → `aws_lambda_function`. Source/build dirs and policy statements are inputs.
-- **`pipeline/`** composes `lambda_job × 2` (named slots `extract` + `transform`) plus the Step Function (FanOut → Consolidate), EventBridge daily rule, SSM SecureString, and the failure-alert rule wired to the shared SNS topic.
-
-Each pipeline root is then a thin composition: `locals` for the source-specific units list, one `module "pipeline" { source = "../../modules/pipeline" … }` block.
+**Chosen:** One shared module, `infra/modules/lambda_job/`. It packages a single Lambda: `null_resource` build (`uv pip install` + copy handler files + copy `src/shared/`) → `archive_file` → IAM role (basic execution + a caller-supplied inline policy) → `aws_lambda_function`. Source/build dirs, env vars, memory/timeout, and policy statements are inputs. The pipeline root composes everything else (SSM parameter, EventBridge rule, lambda permission, on-failure invoke config) directly.
 
 **Alternatives considered:**
-- **Per-pipeline inline resources** (the previous shape). Every new source duplicated the Lambda + IAM + SFN + EB + SSM stack. The `lambda.tf` alone was ~190 lines and grew linearly per Lambda.
-- **One module per resource type** (`modules/lambda/`, `modules/sfn/`, `modules/eventbridge/`). Forces each pipeline root to wire the pieces together. Each new source repeats the wiring; module-level changes don't propagate to the integration.
-- **One module instantiated via `for_each` over a pipelines map** (single TF state for all pipelines). Maximum scale-up ease — adding a source is one map entry — but couples deploys and forces apply to touch every pipeline.
+- **A `pipeline` composition module** that wired two `lambda_job` instances, a Step Functions state machine, EventBridge, SSM, and the alert rule. This was the previous shape; it was removed because it hard-coded a two-Lambda fan-out → consolidate orchestration that the pipeline no longer uses (see EIA-1). Collapsing to one Lambda made the composition module more indirection than it removed.
+- **One module per resource type** (`modules/lambda/`, `modules/eventbridge/`, …). Splits a single pipeline across multiple folders and forces the root to re-wire the pieces anyway.
+- **Fully inline, no module.** Rejected: the packaging logic (build fingerprinting, archive, IAM role with inline policy) is the genuinely fiddly, reusable part and is worth keeping in one place.
 
-**Why two-tier composition won:**
-- New source = copy `infra/pipelines/eia/`, edit `locals.tf` (units list) and `main.tf` (module inputs: schedule, src dirs). No infrastructure code written.
-- Mechanics changes (Lambda runtime, retry policy, tags) land in one module file and propagate.
-- IAM least-privilege policies are derived from `var.source_name` inside the module — `raw/<source>/*` and `curated/<source>/*` ARN patterns are constructed per source automatically.
-- `lambda_job` is reusable on its own for any future single-Lambda need (not just within a pipeline).
+**Why a single `lambda_job` module won:**
+- Lambda packaging + IAM is the only logic worth abstracting; it's reused as-is for any single-Lambda need.
+- A pipeline is now one Lambda plus a handful of wiring resources — small enough to read inline in the root, where the source-specific intent lives.
+- Mechanics changes (runtime, build trigger, base IAM) land in one module file.
 
 **Trade-offs:**
-- The `pipeline` module hard-codes the two-stage fan-out → consolidate shape. A future source needing three stages (e.g. extract → enrich → transform) will need a separate `pipeline_3stage/` module rather than flags on the existing one. This is intentional — don't pre-generalize.
-- Module changes don't auto-deploy; each pipeline root must be re-applied for the change to land.
+- The pipeline root authors its own EventBridge/SSM/alert wiring rather than getting it from a module. At one pipeline this is clearer, not heavier.
 
 ---
 
-## 12. Cross-Lambda Python helpers in `src/shared/`
+## 11. Cross-Lambda Python helpers in `src/shared/`
 
-**Chosen:** A `src/shared/` package vendored into every Lambda's build dir at the zip root. Modules:
-- `paths.py` — single source of truth for the S3 layout (`raw_key`, `raw_prefix`, `curated_prefix`).
+**Chosen:** A `src/shared/` package vendored into the Lambda's build dir at the zip root. Modules:
+- `paths.py` — single source of truth for the S3 layout (`raw_key`, `raw_prefix`, `curated_prefix`, `report_key`).
 - `s3_io.py` — boto3 wrappers (`put_json`, `put_bytes`, `get_json`, `list_keys`, `iter_objects`).
 - `ssm.py` — module-cached `get_parameter`.
+- `sns.py` — `publish(topic_arn, subject, message)`.
 - `time_window.py` — `today_utc()` and `lookback_window(today, days)`.
 
-Handlers import as `from shared import paths, s3_io, ssm, time_window`. The build step in `modules/lambda_job/` copies `src/shared/` into `${build_dir}/shared` and fingerprints `**/*.py` under both `var.src_dir` and `var.shared_dir` in `null_resource.triggers`, so any edit forces a rebuild.
+The handler imports as `from shared import paths, s3_io, ssm, sns, time_window`. The build step in `modules/lambda_job/` copies `src/shared/` into `${build_dir}/shared` and fingerprints `**/*.py` under both `var.src_dir` and `var.shared_dir` in `null_resource.triggers`, so any edit forces a rebuild.
 
 **Alternatives considered:**
-- **Lambda Layer** attached to every function. Rejected at 1–4 pipelines: another infra resource to manage, layer version bumps required across functions, and the per-zip size savings are negligible at our deps footprint.
-- **Vendored copy per Lambda dir** — duplicate `paths.py` etc. into every `src/lambdas/<source>/<stage>/`. Defeats the point.
-- **No shared library; each handler re-implements** the S3 layout and SSM caching. Re-derives the same logic in N places — exactly the problem this refactor was made to solve.
+- **Lambda Layer.** Rejected: another infra resource to manage and version-bump, for negligible size savings at this footprint.
+- **Vendored copy per Lambda dir** — duplicate `paths.py` etc. into each Lambda. Defeats the point.
+- **No shared library** — each handler re-implements the S3 layout and SSM caching. Re-derives the same logic in multiple places.
 
 **Why a copied package won:**
-- One edit to `src/shared/paths.py` propagates to every Lambda zip via the build fingerprint.
-- Handlers shrink to ~25 lines of orchestration; source-specific logic lives in `src/lambdas/<source>/<stage>/{client,schema}.py`.
-- No new AWS infrastructure required (vs Lambda Layer).
-- The Lambda zip is self-contained — no version skew between a Layer and its consumers.
+- One edit to `src/shared/paths.py` propagates to the Lambda zip via the build fingerprint.
+- The handler stays thin orchestration; source-specific logic lives in `client.py`/`schema.py`/`report.py`.
+- No new AWS infrastructure (vs a Lambda Layer), and the zip is self-contained.
 
 **Trade-offs:**
-- A change in `src/shared/` rebuilds every Lambda zip on next `terraform apply`, even when only one Lambda actually exercises the changed function. Acceptable; zips are small and rebuilds are local.
-- Build step has two parallel copy operations (`find … cp --parents` for the Lambda dir, `cp -r` for `shared/`). The shared-side copy isn't filtered to `*.py`, so `__pycache__` from local dev imports can leak into the zip if not cleaned up between builds.
+- The shared-side copy (`cp -r`) isn't filtered to `*.py`, so a local `__pycache__` can leak into the zip if not cleaned between builds.
 
 ---
 
-## 13. Shared helpers are source-agnostic (raw shape owned by the caller)
+## 12. Shared helpers are source-agnostic (raw shape owned by the caller)
 
-**Chosen:** Everything in `src/shared/` takes the source name as a parameter and never assumes a source's payload shape. Raw S3 reads go through `iter_objects(bucket, prefix)`, which yields each file's parsed JSON **as-is**; the calling pipeline owns the file's shape. EIA's transform — whose raw files are flat JSON arrays of rows — flattens at the call site:
+**Chosen:** Everything in `src/shared/` takes the source name as a parameter and never assumes a payload shape. Raw S3 reads go through `iter_objects(bucket, prefix)`, which yields each file's parsed JSON **as-is**; the caller owns the file's shape. EIA's raw files are flat JSON arrays of rows, so the handler flattens at the call site:
 
 ```python
 rows = [normalize_row(r, today)
@@ -281,73 +259,71 @@ rows = [normalize_row(r, today)
 ```
 
 **Alternatives considered:**
-- **A flattening reader in `src/shared/`** (the previous `iter_json_objects`, which did `yield from json.loads(body)`). Worked for EIA but baked EIA's "raw file is a flat array of rows" assumption into shared code. Rejected: NOAA/FRED/EPA may write a JSON object or an envelope (`{"results": [...]}`), which would raise `TypeError` or silently iterate dict keys the first time a new pipeline reused the shared reader.
-- **A `shape=` flag on the shared reader** to switch between flatten/no-flatten. Rejected: pushes per-source branching into the shared layer; the call site is the natural owner of that one-liner.
+- **A flattening reader in `src/shared/`** (`yield from json.loads(body)`). Worked for EIA but baked EIA's "raw file is a flat array of rows" assumption into shared code. A source that writes a JSON object or an envelope (`{"results": [...]}`) would break against it.
+- **A `shape=` flag on the shared reader.** Rejected: pushes per-source branching into the shared layer; the call site is the natural owner of that one-liner.
 
 **Why caller-owned shape won:**
-- The next pipeline reuses `src/shared/` unchanged — no latent runtime break inherited from EIA.
-- The raw-shape decision lives next to the source-specific `schema.py`/`normalize_row`, where a new pipeline's author is already working.
 - `src/shared/` stays a thin, assumption-free boundary: path construction, S3 IO, SSM, SNS, time math — each parameterized by `source`.
+- The raw-shape decision lives next to the source-specific `schema.py`/`normalize_row`.
 
 **Trade-offs:**
-- Each pipeline writes its own one-line flatten (or none). Negligible duplication, and it makes the per-source shape explicit rather than hidden in a shared helper.
+- The caller writes its own one-line flatten (or none). Negligible duplication, and it makes the per-source shape explicit rather than hidden in a shared helper.
 
 ---
 
-# Pipeline-specific decisions
+# EIA-specific decisions
 
-## EIA daily ingestion pipeline
+## EIA pipeline
 
-The first production pipeline. Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, daily.
+Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, daily.
 
-### EIA-1. Orchestration: Step Functions Map (parallel fan-out per BA)
+### EIA-1. Orchestration: a single Lambda with an in-process thread fan-out
 
-**Chosen:** Step Functions `STANDARD` workflow with a `Map` state, `MaxConcurrency=20`, one Lambda invocation per balancing authority. This is the reference pattern reused for any future fan-out batch pipeline (NOAA, EPA).
+**Chosen:** One Lambda, `zeus-dev-eia-ingest`, invoked directly by EventBridge. It fans out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS=20`), writes one raw JSON file per BA, then — in the same invocation — reads back the day's raw partition and consolidates it into a single curated Parquet, writes a run report, and emails the summary.
 
-**Alternatives:**
-- **Single Lambda loop** wrapped in Step Functions — sequential 71-BA loop inside one Lambda; Step Function adds only a retry envelope.
-- **EventBridge → Lambda directly** — no Step Function at all.
+**Alternatives considered:**
+- **Step Functions `Map` fan-out + a separate consolidation Lambda.** This was the previous architecture: a `STANDARD` workflow with a `Map` state (one extract Lambda per BA) feeding a `Consolidate` task. Replaced because the orchestration outweighed the workload — the full run takes ~12.5 s, comfortably inside a single Lambda's limits, and a state machine plus a second Lambda plus their IAM roles and the failure-alert rule were more moving parts than the job warranted.
+- **A sequential `for` loop over BAs.** Simplest, but ~71 paginated HTTP fetches in series would stretch the run substantially. The thread pool keeps it parallel without an orchestrator.
 
-**Why Map fan-out won:**
-- 71 BAs in **9 seconds** in production (vs an estimated 5–15 minutes sequential).
-- Failure isolation: one BA's API error doesn't kill the others.
-- Each BA gets its own retry policy via the state machine.
-- 15-minute Lambda hard timeout becomes a per-BA concern, not a per-run concern.
+**Why a single threaded Lambda won:**
+- 71 BAs complete in ~12.5 s — far inside the 300 s timeout, even with the consolidation pass.
+- `ThreadPoolExecutor` gives the parallelism the `Map` state used to provide (the work is I/O-bound HTTP, which threads handle well).
+- Per-BA failure is handled in-process: each worker catches its own errors and returns a `skipped` result; the run continues. No orchestrator needed for fault isolation.
+- Far less infrastructure: no state machine, no second Lambda, no extra IAM role, no execution-status alert rule.
 
 **Trade-offs:**
-- 71 Lambda invocations vs 1 — still well inside the free tier (1M invocations/month).
-- Slightly more moving pieces (extra IAM role, ASL definition).
+- No Step Functions execution graph in the console. Per-run visibility is the run-report email plus CloudWatch logs/metrics; per-BA forensics means reading logs rather than clicking a branch.
+- Retry is whole-run, not per-BA. At ~12.5 s a full re-run is cheap, and per-BA HTTP errors are already retried inside the client.
 
 ---
 
-### EIA-2. Lambda configuration: 512 MB / 300 s timeout / Python 3.12
+### EIA-2. Lambda configuration: 1024 MB / 300 s timeout / Python 3.12
 
-**Chosen:** `memory_size = 512`, `timeout = 300`, `runtime = python3.12`.
+**Chosen:** `memory_size = 1024`, `timeout = 300`, `runtime = python3.12`.
 
 **Why these numbers:**
-- Memory 512 MB: Lambda CPU scales with memory; 512 is the sweet spot for I/O-bound HTTP work. 128 MB would throttle network throughput; 1024+ wastes money.
-- Timeout 300 s: comfortable headroom — observed runtime is 1–3 s per BA. 5-min ceiling protects against API hangs.
+- Memory 1024 MB: the single Lambda holds up to `MAX_WORKERS` BAs' row-sets in flight during the fan-out *and* builds the full-day pyarrow table during consolidation. Observed peak is ~247 MB, so 1024 MB leaves comfortable headroom; Lambda CPU also scales with memory, which helps the pyarrow write.
+- Timeout 300 s: observed full run is ~12.5 s. The 5-minute ceiling is headroom against a slow EIA API.
 - Python 3.12 matches the project's `.python-version`.
 
 **Performance:**
-- Cold start 500–800 ms (ZIP + 2 MB deps).
-- Warm invocation: <100 ms overhead + API/S3 latency.
+- Cold-start init ~1.2 s (ZIP + `pyarrow`).
+- Full 71-BA run ~12.5 s, peak memory ~247 MB.
 
 ---
 
-### EIA-3. Map state `MaxConcurrency`: 20
+### EIA-3. Fan-out concurrency: `MAX_WORKERS = 20`
 
-**Chosen:** 20 parallel BAs at a time.
+**Chosen:** 20 worker threads fetching BAs in parallel.
 
 **Alternatives:** 5, 10, 50, unbounded.
 
 **Why 20:**
-- EIA's API has rate limits (5,000/hour per key). 20 concurrent × 2 requests per BA × few seconds = well under the limit.
-- AWS account default Lambda concurrency is 1,000 — 20 is 2% of that, leaves room for other workloads.
-- 71 BAs / 20 ≈ 4 waves → ~9 s total. Going higher saves seconds, no real benefit.
+- EIA's API has rate limits. 20 concurrent × a couple of paginated requests per BA stays well under them.
+- 71 BAs across 20 workers is roughly four waves — fast enough that going higher saves little.
 
 **Trade-offs:**
-- Lower would be slower; higher could trip rate limits and cause retries.
+- Lower would be slower; higher risks tripping rate limits and triggering the client's backoff retries.
 
 ---
 
@@ -361,78 +337,74 @@ The first production pipeline. Pulls hourly fuel-type data from EIA Form-930 for
 - One run per day matches the daily-batch cadence.
 
 **Trade-offs:**
-- If EIA is late publishing on a given day, we'd capture stale data and pick it up on the next run (rolling 7-day window covers this).
+- If EIA is late publishing on a given day, the run captures stale data and picks up the revision on the next run (the rolling 7-day window covers this).
 
 ---
 
 ### EIA-5. Lookback strategy: rolling 7 days
 
-**Chosen:** Each daily run pulls the last 7 days, writes to today's S3 partition. Append-only, immutable; downstream de-dup is `qualify row_number() over (partition by (period, respondent, fueltype) order by ingestion_date desc) = 1`.
+**Chosen:** Each daily run pulls the last 7 days and writes to today's S3 partition. Append-only, immutable; downstream de-dup is `qualify row_number() over (partition by (period, respondent, fueltype) order by ingestion_date desc) = 1`.
 
 **Alternatives considered:**
-- **Yesterday-only lookback** — simpler, no de-dup needed downstream, but loses corrections.
+- **Yesterday-only lookback** — simpler, no de-dup needed downstream, but loses EIA's late corrections.
 
 **Why:**
-- Catches EIA's late corrections (which "yesterday only" would silently miss).
-- Bucket stays the immutable source of truth; downstream is non-destructive.
+- Catches EIA's late corrections that "yesterday only" would silently miss.
+- The bucket stays the immutable source of truth; downstream consumption is non-destructive.
 
 **Trade-offs:**
-- Storage grows 7× faster than yesterday-only. At our volume, S3 Standard ≈ $0.014/year — free tier covers it.
-- Downstream needs to know to de-dup. Owned by the dbt staging model.
+- Storage grows faster than yesterday-only. At this volume the cost is within the free tier.
+- Downstream must de-dup.
 
 ---
 
 ### EIA-6. Do not coalesce API or S3 requests
 
-**Chosen:** One Lambda per balancing authority, one EIA API call per Lambda (paginated where needed), one `s3:PutObject` per Lambda. No batching across BAs.
+**Chosen:** One EIA API call per balancing authority (paginated where needed) and one `s3:PutObject` per BA. No batching across BAs.
 
 **Alternatives considered:**
-- **Coalesce EIA API calls** — pass multiple respondents in a single `facets[respondent][]` request. 71 GETs → 1–5 GETs.
-- **Coalesce S3 writes** — one combined JSON per source per day instead of 71 small files. 71 PUTs → 1 PUT.
+- **Coalesce EIA API calls** — pass multiple respondents in one `facets[respondent][]` request.
+- **Coalesce S3 writes** — one combined JSON per day instead of 71 small files.
 
 **Why we don't coalesce:**
-- Cost is already negligible: $0.0004/run on S3 PUTs, $1.50/year on Step Function transitions.
-- API-side coalescing would forfeit Map's per-BA failure isolation and per-BA observability (separate log streams, separate retry counts in the Step Function console).
-- S3-side coalescing would force a post-Map aggregation step (Map iterations can't write to a shared object), adding orchestration complexity.
-
-**When to revisit:**
-- A new source ships with stricter rate limits than EIA.
-- Per-Lambda overhead becomes a real fraction of runtime as unit count grows past a few hundred.
+- Cost is already negligible (a handful of cents/month for S3 PUTs at this volume).
+- One file per BA preserves per-BA traceability: a missing or stale raw file pinpoints exactly which BA had a problem, and the per-BA skip semantics depend on each fetch being independent.
+- A combined-write approach would couple all BAs into one object, so a single bad BA could corrupt or block the whole file.
 
 ---
 
-### EIA-7. Active BA list: 71 BAs (10 permanently empty removed) + empty-rows guard
+### EIA-7. Active BA list: 71 BAs (10 permanently empty removed) + per-BA skip handling
 
-**Chosen:** Reduced the list from 81 to 71. Removed: `AEC`, `EEI`, `GLHB`, `GRIF`, `HGMA`, `NSB`, `SPA`, `WACM`, `WAUW`, `WWA`. Lambda raises `ValueError` if `fetch_ba` returns 0 rows, failing the execution and triggering the SNS alert.
+**Chosen:** The list was reduced from 81 to 71. Removed: `AEC`, `EEI`, `GLHB`, `GRIF`, `HGMA`, `NSB`, `SPA`, `WACM`, `WAUW`, `WWA`. A BA that returns 0 rows (or whose fetch errors) is recorded as `skipped` and the run continues; only a total outage fails the run.
 
 **Why:**
-- Confirmed via direct EIA API query (`total: "0"`) and two consecutive day's S3 partitions: these 10 BAs consistently return no data on the `electricity/rto/fuel-type-data` endpoint.
-- They exist in the EIA system but do not report hourly fuel-type data via Form EIA-930.
-- Keeping them generated empty 2-byte `[]` files; the empty-rows guard would now fail the pipeline daily for them.
+- Confirmed via direct EIA API query (`total: "0"`) across consecutive days: these 10 BAs consistently return no data on the `electricity/rto/fuel-type-data` endpoint. They exist in the EIA system but don't report hourly fuel-type data via Form EIA-930.
+- Keeping them generated empty `[]` files and a daily skip entry for no signal.
+- Per-BA skip (rather than hard-fail) keeps one flaky or empty BA from sinking the entire daily run; the skip is recorded in the run report and surfaced in the email, including a 30-day skip-frequency history.
 
 **Trade-offs:**
-- If EIA begins publishing data for one of these BAs in the future, it will go unnoticed until the list is manually updated.
+- If EIA begins publishing data for one of the removed BAs, it goes unnoticed until the list is manually updated.
+- A BA that silently starts returning empty shows up as a skip in the email rather than a hard failure — visible, but not a page.
 
 ---
 
-### EIA-8. Consolidation stage: dedicated transform Lambda (post-fan-out)
+### EIA-8. Consolidation: in-process, after the fan-out
 
-**Chosen:** A separate `zeus-dev-eia-transform` Lambda, invoked once in a `Consolidate` state after the `Map` fan-out completes. It reads all raw JSON files for the day's partition, consolidates them into a single Snappy-compressed Parquet, and writes to `curated/eia/`.
+**Chosen:** After the thread fan-out finishes, the same Lambda lists the day's `raw/eia/...` partition, reads every file, normalizes each row (`schema.normalize_row`), and writes one Snappy-compressed Parquet to `curated/eia/...`. It then writes the run report and emails the summary, and finally raises `ValueError` if zero rows were consolidated.
 
 **Alternatives considered:**
-- **Write Parquet directly in each extract Lambda** — each BA writes its own Parquet shard. Rejected: 71 separate Parquet files per day in the curated layer, instead of one; Snowflake external stage + Snowpipe works best against a single file per partition.
-- **Consolidate in Snowflake only** — skip the curated layer; Snowpipe loads raw JSON, dbt handles typing and consolidation. Rejected: a pre-typed Parquet curated layer is cheaper and faster to query from Snowflake external stage; also preserves the curated layer as a reusable artifact independent of Snowflake.
-- **Post-Map consolidation inside the fan-out iterator** — not possible; each `Map` iteration is independent and cannot coordinate writes to a shared object.
+- **A separate consolidation Lambda** (the previous `transform` worker invoked by a Step Functions `Consolidate` task). Removed with the orchestrator — see EIA-1.
+- **Write Parquet directly in each per-BA fetch** — produces 71 Parquet shards/day instead of one. A single file per partition is the cleaner curated target.
+- **Skip the curated layer; consolidate at query time** — rejected: a pre-typed single Parquet is cheaper and faster to query and keeps the curated artifact independent of any query engine.
 
 **Why:**
-- `Map` → `Consolidate` is a natural Step Functions pattern: wait for all parallel branches to land, then run one pass over the results.
-- A single Parquet per day is the natural landing target for a Snowflake external stage + Snowpipe.
-- Keeping raw and curated separate preserves the raw layer as the immutable source of truth; re-running the transform never modifies raw files.
-- The transform Lambda's empty-rows guard (`ValueError` if no raw files found or all empty) means a silent failure in the fan-out is caught before the curated layer is overwritten.
+- Reading the raw partition back (rather than consolidating in-memory from the fetch results) means the consolidation reflects exactly what landed in S3 — partial fan-outs consolidate cleanly.
+- Keeping raw and curated separate preserves raw as the immutable source of truth; re-running never modifies raw files.
+- The total-outage guard (`ValueError` when zero rows consolidated) turns a silent empty day into a hard failure that reaches the on-failure destination.
 
 **Trade-offs:**
-- Two Lambda deployments per pipeline instead of one (separate source dirs, separate build artifacts, separate IAM role).
-- Transform Lambda requires `s3:ListBucket` + `s3:GetObject` on `raw/eia/*` and `s3:PutObject` on `curated/eia/*`.
+- Consolidation reads the whole day's prefix, so a same-day re-run includes any earlier writes for that day and overwrites the curated Parquet. This is idempotent by key and matches the append-only/overwrite-by-key contract.
+- The Lambda needs `s3:ListBucket` + `s3:GetObject` on `raw/eia/*` and `reports/eia/*`, and `s3:PutObject` on `curated/eia/*` and `reports/eia/*`.
 
 ---
 
@@ -440,15 +412,17 @@ The first production pipeline. Pulls hourly fuel-type data from EIA Form-930 for
 
 | Metric | Value |
 |---|---|
-| Step Function execution time (71 BAs) | **~9 seconds** |
-| Lambda invocations per run | 71 (with `MaxConcurrency=20`) |
-| Cold start estimate | 500–800 ms |
+| Full run (71 BAs) | **~12.5 seconds** |
+| Lambda invocations per run | 1 (internal fan-out across 20 threads) |
+| Peak memory used | ~247 MB (of 1024 MB) |
+| Cold-start init | ~1.2 s |
 | Daily AWS cost estimate | <$0.01 (well within free tier) |
 | EIA API requests per run | ~71–140 (depends on pagination) |
 
 **Failure modes covered:**
-- Per-BA Lambda retry (2 attempts) on `Lambda.ServiceException`, `Lambda.AWSLambdaException`, `Lambda.SdkClientException`, `Lambda.TooManyRequestsException`.
-- API-level retry inside the Lambda on HTTP 502/503/504 with backoff (10s, 20s, 30s).
+- Per-BA error or 0-row response → recorded as `skipped`, run continues.
+- API-level retry inside the client on HTTP 502/503/504 with backoff (10 s, 20 s, 30 s).
 - Late-arriving EIA corrections caught by the 7-day rolling lookback.
-- 0-row response → `ValueError` → SFN failure → SNS alert.
+- Total outage (0 rows consolidated) → `ValueError` → failed async invocation → on-failure destination → SNS alert.
+- Run-report email published on every completed run (succeeded/skipped counts, skip reasons, 30-day skip history).
 - Source-of-truth integrity preserved via append-only S3 partitions; downstream de-dup is non-destructive.
