@@ -39,3 +39,8 @@ variable "alert_email" {
   type        = string
   description = "Email address to receive pipeline failure alerts."
 }
+
+variable "eia_loader_public_key" {
+  type        = string
+  description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_EIA_LOADER service user. The matching private key is set out-of-band in SSM; nothing secret here."
+}

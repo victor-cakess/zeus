@@ -23,6 +23,11 @@ variable "zip_path" {
   type        = string
 }
 
+variable "artifact_bucket" {
+  description = "S3 bucket the Lambda zip is uploaded to (deployed via s3_key, not direct upload — the package exceeds the 50 MiB direct-upload limit)."
+  type        = string
+}
+
 variable "handler" {
   type    = string
   default = "handler.lambda_handler"
