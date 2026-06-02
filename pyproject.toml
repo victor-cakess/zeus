@@ -13,4 +13,11 @@ dev = [
     "pyarrow>=24.0.0",
     "requests>=2.32.3",
     "ruff>=0.15.12",
+    # For the one-off Snowflake backfill (backfill/eia/snowflake_load.py), which
+    # reuses src/shared/snowflake_io.py. Pins match the Lambda's requirements.txt:
+    # the connector's loose bounds otherwise resolve to an incompatible
+    # pyOpenSSL/cryptography pair that crashes at import.
+    "snowflake-connector-python==3.12.3",
+    "cryptography==43.0.3",
+    "pyOpenSSL==24.2.1",
 ]

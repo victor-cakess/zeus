@@ -2,7 +2,7 @@
 
 Design decisions for the Zeus data platform — an energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) are at the top of this document. EIA-specific decisions are grouped in their own section below.
 
-The platform currently runs one production pipeline (EIA hourly fuel-type ingestion) and has a provisioned Snowflake warehouse.
+The platform currently runs one production pipeline (EIA hourly fuel-type ingestion): it lands data in S3 and loads it into a Snowflake landing table.
 
 Format per entry: the decision, alternatives considered, why the chosen option won, and known trade-offs.
 
@@ -147,20 +147,22 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 
 ## 7. Lambda packaging: ZIP via `archive_file` + `null_resource`
 
-**Chosen:** A local `uv pip install --target` builds deps, `archive_file` zips, and the Lambda references the zip directly.
+**Chosen:** A local `uv pip install --target` builds deps and `archive_file` zips. The zip is uploaded to S3 (`aws_s3_object` → `lambda-artifacts/<name>.zip` in the data bucket) and the Lambda references it via `s3_bucket`/`s3_key`.
 
 **Alternatives:**
 - **Container image (ECR)** — Docker build pushed to ECR; Lambda pulls the image.
 - **Lambda layer** for dependencies, source as a separate ZIP.
+- **Direct zip upload** (`filename` on `aws_lambda_function`) — simplest, but capped at 50 MiB zipped.
 
-**Why ZIP won:**
+**Why ZIP-via-S3 won:**
 - No Docker/ECR moving parts; the build is a local `uv` invocation.
 - The zip is self-contained — no version skew between a layer and its consumers.
-- Stays well under the 250 MB unzipped limit (the ingest package is ~44 MB zipped, dominated by `pyarrow`).
+- The ingest package is ~49 MiB zipped (dominated by `pyarrow`, plus `snowflake-connector-python` + `cryptography`), over the 50 MiB *direct-upload* limit but well under the 250 MiB unzipped limit. S3-based deploy removes the ceiling, so a future dep bump can't silently break the deploy.
 
 **Trade-offs:**
 - `null_resource` runs `uv pip install` on the operator's machine; it relies on `uv` + Python 3.12 being on PATH. If a future dep needs a different Linux ABI, we'd switch to a container or Docker build.
-- `pyarrow` makes the zip large (~44 MB) and adds ~1.2 s of cold-start init. Acceptable for a once-daily batch job.
+- `pyarrow` + the Snowflake connector make the zip large (~49 MiB) and add ~1.2 s of cold-start init. Acceptable for a once-daily batch job.
+- The artifact bucket is the shared data bucket under a `lambda-artifacts/` prefix — pragmatic at one pipeline; a dedicated artifacts bucket is the cleaner split if this grows.
 
 **Detour worth recording:**
 - An initial `python3 -m pip install --target …` failed because the project's `.venv` is uv-managed and pip-less, but `VIRTUAL_ENV` was set so `python3` resolved to the pip-less venv interpreter.
@@ -199,7 +201,7 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 - It lives in `infra/core/` because a warehouse is account-level shared infrastructure, not pipeline-specific.
 
 **Trade-offs:**
-- It is provisioned but not connected to S3.
+- It now backs the EIA Snowflake load (EIA-9): the loader's `COPY INTO` runs on it. At one pipeline a single shared warehouse is sufficient; a per-pipeline or per-workload warehouse split would come only if loads start contending.
 
 ---
 
@@ -405,6 +407,30 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 **Trade-offs:**
 - Consolidation reads the whole day's prefix, so a same-day re-run includes any earlier writes for that day and overwrites the curated Parquet. This is idempotent by key and matches the append-only/overwrite-by-key contract.
 - The Lambda needs `s3:ListBucket` + `s3:GetObject` on `raw/eia/*` and `reports/eia/*`, and `s3:PutObject` on `curated/eia/*` and `reports/eia/*`.
+
+---
+
+### EIA-9. Snowflake load: `COPY INTO` a landing table from an external stage
+
+**Chosen:** After writing the day's curated Parquet, the same Lambda runs one `COPY INTO ZEUS_DEV.EIA.EIA_GRID` from an external stage (`EIA_STAGE`) over `curated/eia/`. Snowflake reads the Parquet from S3 itself via a storage integration (`ZEUS_DEV_EIA_S3_INT` + a paired AWS IAM role); data never streams through the Lambda. The Lambda authenticates as a least-privilege key-pair service user (`ZEUS_DEV_EIA_LOADER`, USAGE + INSERT only). `EIA_GRID` is an append-only landing table: duplicates from the 7-day lookback overlap (EIA-5) are deduped downstream in dbt on `(period, respondent, fueltype)` keeping the latest `ingestion_date`, mirroring the S3 raw-layer contract (decision 3). All Snowflake DDL lives in `infra/core/` alongside the warehouse.
+
+**Alternatives considered:**
+- **Snowpipe auto-ingest** (S3 event → SQS → Snowpipe). More decoupled, but needs an SQS queue, the pipe, and S3 notification wiring for the same outcome; the Lambda already knows when the Parquet is ready.
+- **Stream rows through the Lambda** (`INSERT` via the connector). Pushes the whole day's data through the function's memory; `COPY`-from-stage lets Snowflake read S3 directly.
+- **Password auth for the loader.** Rejected: a password would land in tfstate or need an out-of-band `ALTER USER`. Key-pair keeps only the public key in Terraform; the private key lives in SSM (`/zeus/dev/snowflake/eia_loader_private_key`), set out-of-band — the same contract as the API key (decisions 5–6).
+- **Write-time dedup (`MERGE`).** Rejected: it discards the revision history the overlapping lookback is designed to capture, and is more complex than an append + downstream `qualify`.
+
+**Why:**
+- Shortest path that lands rows in the same invocation, with no new AWS runtime infrastructure — just the storage integration, an IAM role, and an SSM secret.
+- `FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE)` is **required**: without it Snowflake reads the Parquet `period` as a raw INT64 and the timestamp loads as "Invalid date".
+- Snowflake's per-file load metadata makes a same-day re-run idempotent (the already-loaded Parquet is skipped); cross-day overlap is the intended duplication, resolved downstream.
+- A load failure is recorded in the run report, emailed, then re-raised so the async on-failure destination alerts (decision 8) — the curated Parquet stays safe in S3 and the load is re-runnable.
+
+**Trade-offs:**
+- The append-only landing table carries ~7× row duplication from the lookback overlap; the deduped view is dbt's job (not yet built).
+- The storage integration and service user require `ACCOUNTADMIN` to create, so `infra/core/`'s Snowflake provider runs as `ACCOUNTADMIN`.
+- `snowflake-connector-python` declares loose `pyOpenSSL`/`cryptography` bounds that resolve to an import-incompatible pair; both are pinned (`cryptography==43.0.3`, `pyOpenSSL==24.2.1`). Adding the connector pushed the zip to ~49 MiB, motivating the S3-based Lambda deploy (decision 7).
+- History is loaded once by a whole-stage backfill (`backfill/eia/snowflake_load.py`) that reuses the same `COPY` helper; it must not be re-run (load metadata expires after 64 days, which would re-load old files as duplicates).
 
 ---
 

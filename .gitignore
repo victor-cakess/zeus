@@ -31,3 +31,6 @@ CLAUDE.md
 ADR.md
 temp_decisions
 snowflake.md
+
+sf_eia_loader.p8
+sf_eia_loader.pub
