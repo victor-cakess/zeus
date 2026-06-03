@@ -31,3 +31,10 @@ def raw_key(source: str, unit: str, d: date) -> str:
 
 def report_key(source: str, d: date) -> str:
     return report_prefix(source, d) + "run_report.json"
+
+
+def partition_date(key: str) -> date:
+    """Inverse of the ingestion_year=/month=/day= partition this module builds —
+    parse the ingestion date back out of any key under a partitioned prefix."""
+    p = dict(s.split("=") for s in key.split("/") if "=" in s)
+    return date(int(p["ingestion_year"]), int(p["ingestion_month"]), int(p["ingestion_day"]))

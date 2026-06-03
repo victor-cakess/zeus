@@ -19,6 +19,7 @@ module "noaa_landing" {
   table_comment     = "Raw NOAA daily weather landing table — append-only, loaded by COPY INTO."
 
   # Mirrors src/lambdas/noaa/ingest/schema.py (one row per ba/station/date, wide).
+  # The datatype columns (TMAX…ADPT) mirror schema.DATA_TYPES — keep in sync.
   columns = [
     { name = "DATE", type = "DATE" },
     { name = "STATION", type = "VARCHAR(16777216)" },

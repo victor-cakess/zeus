@@ -9,20 +9,11 @@ SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 SKIP_HISTORY_DAYS = int(os.environ.get("SKIP_HISTORY_DAYS", "30"))
 
 
-def _date_from_report_key(key: str) -> date:
-    parts = dict(p.split("=") for p in key.split("/") if "=" in p)
-    return date(
-        int(parts["ingestion_year"]),
-        int(parts["ingestion_month"]),
-        int(parts["ingestion_day"]),
-    )
-
-
 def _skip_history(source: str, today: date) -> dict[str, int]:
     cutoff = today - timedelta(days=SKIP_HISTORY_DAYS - 1)
     root = f"reports/{source}/"
     keys = [
-        k for k in s3_io.list_keys(BUCKET, root) if _date_from_report_key(k) >= cutoff
+        k for k in s3_io.list_keys(BUCKET, root) if paths.partition_date(k) >= cutoff
     ]
     reports = [s3_io.get_json(BUCKET, k) for k in keys]
     return report.skip_history(reports)

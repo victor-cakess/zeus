@@ -7,6 +7,20 @@ import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 
 
+def copy_statement(database: str, schema: str, table: str, stage: str, path: str = "") -> str:
+    """Build a `COPY INTO <table> FROM @<stage>/<path>` for a Parquet stage. The daily
+    handlers pass the day-partition `path`; a whole-stage load passes `""`.
+    USE_LOGICAL_TYPE = TRUE makes Snowflake honor Parquet DATE/TIMESTAMP logical types
+    (without it EIA's `period` loads as INT64 and NOAA's `date` as INT32 → "Invalid date");
+    MATCH_BY_COLUMN_NAME maps Parquet fields onto table columns by name."""
+    return (
+        f"COPY INTO {database}.{schema}.{table} "
+        f"FROM @{database}.{schema}.{stage}/{path} "
+        f"FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE) "
+        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE"
+    )
+
+
 def _der_from_pem(pem: str) -> bytes:
     """PKCS8 PEM private key (as stored in SSM) → DER bytes for the connector."""
     key = serialization.load_pem_private_key(pem.encode(), password=None)
