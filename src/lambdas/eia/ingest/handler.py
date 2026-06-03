@@ -75,7 +75,7 @@ def lambda_handler(event, context) -> dict:
     # the pool to avoid a race on the module-level cache across workers.
     api_key = ssm.get_parameter(API_KEY_SSM_PATH)
 
-    # Fan out the per-BA fetch + raw write. Replaces the Step Function Map.
+    # Fan out the per-BA fetch + raw write across the thread pool.
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         results = list(
             pool.map(lambda u: _fetch_one(u, start, end, api_key, today), units)

@@ -1,8 +1,8 @@
 # Architectural Decision Records
 
-Design decisions for the Zeus data platform — an energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) are at the top of this document. EIA-specific decisions are grouped in their own section below.
+Design decisions for the Zeus data platform — an energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) are at the top of this document. Pipeline-specific decisions are grouped per source below.
 
-The platform currently runs one production pipeline (EIA hourly fuel-type ingestion): it lands data in S3 and loads it into a Snowflake landing table.
+The platform runs two production ingestion pipelines — **EIA** (hourly fuel-type) and **NOAA** (daily weather summaries) — each landing data in S3 and loading it into a Snowflake landing table, plus a **digest** Lambda that emails one combined daily run-report across both. The two sources share balancing-authority codes (`ba`) so weather joins to grid data downstream.
 
 Format per entry: the decision, alternatives considered, why the chosen option won, and known trade-offs.
 
@@ -33,15 +33,16 @@ Format per entry: the decision, alternatives considered, why the chosen option w
 
 ```
 infra/
-  core/                 # shared S3 bucket + SNS alerts topic + Snowflake warehouse
-    backend.tf, providers.tf, variables.tf, locals.tf, main.tf, sns.tf, outputs.tf
+  core/                 # shared S3 bucket + SNS alerts topic + Snowflake warehouse/db + per-source landing stacks
+    backend.tf, ..., snowflake.tf, snowflake_eia.tf, snowflake_noaa.tf
   modules/
-    lambda_job/         # one Lambda + IAM role + ZIP packaging (the only shared module)
+    lambda_job/         # one Lambda + IAM role + ZIP packaging
+    snowflake_landing/  # one source's Snowflake landing stack (decision 13)
   pipelines/
-    eia/
+    eia/ noaa/ digest/  # one self-contained root each
       backend.tf, providers.tf, variables.tf, locals.tf
       remote_state.tf   # consumes infra/core outputs
-      main.tf           # SSM param + lambda_job + EventBridge rule + on-failure config
+      main.tf           # SSM param(s) + lambda_job + EventBridge rule + on-failure config
       outputs.tf
   build/                # gitignored Lambda zip artifacts
 ```
@@ -102,7 +103,7 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 
 **Why:**
 - `src/` is the conventional Python project root (visible to type checkers, IDE indexers, and packaging tools).
-- A single `ingest/` stage holds the whole pipeline's code: `handler.py` (orchestration) plus `client.py`, `schema.py`, `report.py`.
+- A single `ingest/` stage holds the pipeline's source-specific code: `handler.py` (orchestration) plus `client.py` and `schema.py`. Shared, source-agnostic logic (including run reporting, `report.py`) lives in `src/shared/` (decision 11).
 - Keeps Lambda source out of `extraction/` (gitignored notebooks) — a source-of-truth Lambda must be in git.
 
 ---
@@ -162,7 +163,7 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 **Trade-offs:**
 - `null_resource` runs `uv pip install` on the operator's machine; it relies on `uv` + Python 3.12 being on PATH. If a future dep needs a different Linux ABI, we'd switch to a container or Docker build.
 - `pyarrow` + the Snowflake connector make the zip large (~49 MiB) and add ~1.2 s of cold-start init. Acceptable for a once-daily batch job.
-- The artifact bucket is the shared data bucket under a `lambda-artifacts/` prefix — pragmatic at one pipeline; a dedicated artifacts bucket is the cleaner split if this grows.
+- The artifact bucket is the shared data bucket under a `lambda-artifacts/` prefix — pragmatic at this scale; a dedicated artifacts bucket is the cleaner split if this grows.
 
 **Detour worth recording:**
 - An initial `python3 -m pip install --target …` failed because the project's `.venv` is uv-managed and pip-less, but `VIRTUAL_ENV` was set so `python3` resolved to the pip-less venv interpreter.
@@ -170,25 +171,27 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 
 ---
 
-## 8. Observability: run-report email + Lambda on-failure destination (shared SNS topic)
+## 8. Observability: a single daily digest email + per-pipeline on-failure destinations (shared SNS topic)
 
-**Chosen:** A shared SNS topic `zeus-dev-alerts` in `infra/core/`, fed by two paths from the ingest Lambda:
-1. **Run-report email** — on every completed run the Lambda publishes a formatted summary: succeeded/skipped counts, per-skip reasons, and a 30-day skip-frequency history (built by reading recent run reports from the reports layer).
-2. **Failure alert** — the Lambda's asynchronous **on-failure destination** points at the topic. EventBridge invokes the Lambda asynchronously with `maximum_retry_attempts = 0`, so any unhandled crash (OOM, timeout, init error) or the total-outage `ValueError` routes the failed invocation record to the topic.
+**Chosen:** A shared SNS topic `zeus-dev-alerts` in `infra/core/`, fed by two paths:
+1. **Combined run-report email** — each ingest Lambda only *writes* its `run_report.json` to the reports layer (succeeded/skipped, per-skip reasons, Snowflake rows loaded). A separate **digest Lambda** (`zeus-dev-reports-digest`, its own pipeline root) runs once daily after both ingest runs, reads every source's report for the day, computes each source's 30-day skip history, and publishes **one** combined email covering all sources. Adding a source = appending it to the digest's `var.sources`.
+2. **Failure alert** — each ingest Lambda's asynchronous **on-failure destination** points at the topic. EventBridge invokes asynchronously with `maximum_retry_attempts = 0`, so any unhandled crash (OOM, timeout, init error) or the total-outage `ValueError` routes the failed invocation record to the topic. The digest has its own on-failure destination too.
 
 **Alternatives considered:**
-- **EventBridge rule on a Step Functions execution-status change** — the previous approach, which depended on an orchestrator that no longer exists. Removed with the move to a single Lambda.
-- **CloudWatch alarm on the Lambda `Errors` metric** — also catches every crash mode, but carries no run context in the notification and needs threshold/period tuning. The on-failure destination delivers the failed event directly with zero added configuration.
-- **Per-pipeline SNS topic** — creates an extra subscription and confirmation email per pipeline. The shared topic routes everything to one inbox.
+- **Per-pipeline run-report email** (the previous shape — each Lambda emailed its own summary). At one source it was fine; at N sources it's N emails/day. Replaced by the digest so the inbox gets exactly one summary regardless of source count. The per-pipeline Lambdas were slimmed accordingly (they no longer publish on success; they keep only the on-failure destination).
+- **CloudWatch alarm on the Lambda `Errors` metric** — also catches every crash mode, but carries no run context and needs threshold/period tuning. The on-failure destination delivers the failed event directly with zero added configuration.
+- **Per-pipeline SNS topic** — an extra subscription/confirmation per pipeline. The shared topic routes everything to one inbox.
+- **Chaining the digest off the ingest Lambdas** (invoke it when the last source finishes) — couples the pipelines and needs completion signalling. A standalone scheduled digest that reads whatever reports exist is decoupled and tolerates a missing report (surfaced as "no report", since that source's own on-failure alert already fired).
 
 **Why:**
-- The run-report email is the day-to-day signal: it always fires and carries the per-BA outcome (which is the operationally useful detail).
-- The on-failure destination is the safety net for crashes that happen *before* the Lambda can publish its own report. It's a single `aws_lambda_function_event_invoke_config` resource.
-- The shared topic means the pipeline only needs `sns:Publish` permission and the destination wiring — no changes to `infra/core/`.
+- One email/day across all sources is the operational signal that scales — the digest reuses `src/shared/report.py` and reads the persisted `run_report.json` files, so it needs no coordination with the ingest runs.
+- The on-failure destination is the per-pipeline safety net for crashes that happen *before* the report is written. It's a single `aws_lambda_function_event_invoke_config` resource per pipeline.
+- The shared topic means each pipeline only needs `sns:Publish` permission (for its destination) and the digest needs `s3:GetObject`/`ListBucket` on `reports/*` — no changes to `infra/core/`.
 
 **Trade-offs:**
-- The on-failure alert is the raw Lambda async-destination envelope (JSON), not a hand-formatted message. The formatted, human-readable summary comes from the run-report email; the destination envelope is the fallback for hard crashes.
-- `maximum_retry_attempts = 0` means a transient platform error fails the run rather than auto-retrying. The daily schedule and the 7-day rolling lookback make the next run self-healing, and per-BA HTTP errors are already retried inside the Lambda.
+- The digest fires on a schedule (08:00 UTC) rather than on completion, so it assumes both ingest runs (07:00 / 07:30 UTC) have finished — fine with the staggered crons, and a not-yet-written report just shows as "no report".
+- The on-failure alert is the raw Lambda async-destination envelope (JSON), not hand-formatted. The readable summary comes from the digest; the envelope is the fallback for hard crashes.
+- `maximum_retry_attempts = 0` means a transient platform error fails the run rather than auto-retrying. The daily schedule and the rolling lookback make the next run self-healing, and per-unit HTTP errors are already retried inside the Lambda.
 
 ---
 
@@ -201,13 +204,13 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 - It lives in `infra/core/` because a warehouse is account-level shared infrastructure, not pipeline-specific.
 
 **Trade-offs:**
-- It now backs the EIA Snowflake load (EIA-9): the loader's `COPY INTO` runs on it. At one pipeline a single shared warehouse is sufficient; a per-pipeline or per-workload warehouse split would come only if loads start contending.
+- It backs both sources' Snowflake loads (EIA-9 + NOAA): each loader's `COPY INTO` runs on it. A single shared x-small warehouse is sufficient for these staggered daily batch loads; a per-pipeline or per-workload warehouse split would come only if loads start contending.
 
 ---
 
 ## 10. Terraform module: a single reusable `lambda_job`
 
-**Chosen:** One shared module, `infra/modules/lambda_job/`. It packages a single Lambda: `null_resource` build (`uv pip install` + copy handler files + copy `src/shared/`) → `archive_file` → IAM role (basic execution + a caller-supplied inline policy) → `aws_lambda_function`. Source/build dirs, env vars, memory/timeout, and policy statements are inputs. The pipeline root composes everything else (SSM parameter, EventBridge rule, lambda permission, on-failure invoke config) directly.
+**Chosen:** A shared module, `infra/modules/lambda_job/`. It packages a single Lambda: `null_resource` build (`uv pip install` + copy handler files + copy `src/shared/`) → `archive_file` → IAM role (basic execution + a caller-supplied inline policy) → `aws_lambda_function`. Source/build dirs, env vars, memory/timeout, and policy statements are inputs. The pipeline root composes everything else (SSM parameter, EventBridge rule, lambda permission, on-failure invoke config) directly. (A second shared module, `snowflake_landing`, was later added for the per-source Snowflake DDL — see decision 13.)
 
 **Alternatives considered:**
 - **A `pipeline` composition module** that wired two `lambda_job` instances, a Step Functions state machine, EventBridge, SSM, and the alert rule. This was the previous shape; it was removed because it hard-coded a two-Lambda fan-out → consolidate orchestration that the pipeline no longer uses (see EIA-1). Collapsing to one Lambda made the composition module more indirection than it removed.
@@ -220,7 +223,7 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 - Mechanics changes (runtime, build trigger, base IAM) land in one module file.
 
 **Trade-offs:**
-- The pipeline root authors its own EventBridge/SSM/alert wiring rather than getting it from a module. At one pipeline this is clearer, not heavier.
+- The pipeline root authors its own EventBridge/SSM/alert wiring rather than getting it from a module. Across the handful of pipeline roots this is clearer, not heavier.
 
 ---
 
@@ -231,9 +234,11 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 - `s3_io.py` — boto3 wrappers (`put_json`, `put_bytes`, `get_json`, `list_keys`, `iter_objects`).
 - `ssm.py` — module-cached `get_parameter`.
 - `sns.py` — `publish(topic_arn, subject, message)`.
-- `time_window.py` — `today_utc()` and `lookback_window(today, days)`.
+- `snowflake_io.py` — `copy_into(...)`: key-pair connection, run one statement, return rows loaded (caller builds the SQL).
+- `time_window.py` — `today_utc()`, `lookback_window(today, days)` (hourly `YYYY-MM-DDTHH`, EIA), and `lookback_window_dates(today, days)` (date `YYYY-MM-DD`, NOAA).
+- `report.py` — source-agnostic run-report build, per-source `format_email`, `format_digest` (combines all sources), and `skip_history`. Used by both ingest Lambdas and the digest.
 
-The handler imports as `from shared import paths, s3_io, ssm, sns, time_window`. The build step in `modules/lambda_job/` copies `src/shared/` into `${build_dir}/shared` and fingerprints `**/*.py` under both `var.src_dir` and `var.shared_dir` in `null_resource.triggers`, so any edit forces a rebuild.
+Handlers import as `from shared import paths, report, s3_io, snowflake_io, ssm, time_window`. The build step in `modules/lambda_job/` copies `src/shared/` into `${build_dir}/shared` and fingerprints `**/*.py` under both `var.src_dir` and `var.shared_dir` in `null_resource.triggers`, so any edit forces a rebuild. `report.py` started as an EIA sibling module and was promoted to `src/shared/` once a second source needed it — it was already source-agnostic (takes `source` as a param).
 
 **Alternatives considered:**
 - **Lambda Layer.** Rejected: another infra resource to manage and version-bump, for negligible size savings at this footprint.
@@ -242,7 +247,7 @@ The handler imports as `from shared import paths, s3_io, ssm, sns, time_window`.
 
 **Why a copied package won:**
 - One edit to `src/shared/paths.py` propagates to the Lambda zip via the build fingerprint.
-- The handler stays thin orchestration; source-specific logic lives in `client.py`/`schema.py`/`report.py`.
+- The handler stays thin orchestration; the only source-specific modules are `client.py`/`schema.py`.
 - No new AWS infrastructure (vs a Lambda Layer), and the zip is self-contained.
 
 **Trade-offs:**
@@ -273,7 +278,25 @@ rows = [normalize_row(r, today)
 
 ---
 
-# EIA-specific decisions
+## 13. Per-source Snowflake DDL as a reusable `snowflake_landing` module
+
+**Chosen:** A second shared module, `infra/modules/snowflake_landing/`, encapsulates one source's entire Snowflake landing stack — storage integration + paired AWS IAM trust role, schema, `<SOURCE>_GRID` table, external stage over `curated/<source>/`, and the least-privilege key-pair loader user with its grants. Every name is **derived from `source_name`** (`ZEUS_DEV_<SOURCE>_S3_INT`, `<SOURCE>_GRID`, `<SOURCE>_STAGE`, `ZEUS_DEV_<SOURCE>_LOADER`, …); the table columns are a `list(object({name,type}))` input. `infra/core` calls it once per source (`module "eia_landing"`, `module "noaa_landing"`); the shared `ZEUS_DEV` database lives in `snowflake.tf`, passed in as a name.
+
+**Alternatives considered:**
+- **Copy `snowflake_eia.tf` → `snowflake_noaa.tf`** (duplicate ~200 lines of inline DDL per source). Simple and zero churn, but every fix has to be applied in N places and the regularity (integration + IAM + schema + table + stage + loader + grants) is exactly what a module captures.
+- **Leave EIA inline, only modularize NOAA.** Asymmetric — the two sources would drift, and the module wouldn't be exercised by the established pipeline.
+
+**Why a shared module won:**
+- The Snowflake stack is highly regular across sources; only names + the column list vary. One module call per source is the DRY-est expression and keeps the two stacks structurally identical.
+- New sources are a single module block, not a copy-paste of the DDL.
+
+**Trade-offs / the migration:**
+- Moving EIA's already-live resources into the module changed their state addresses, so it required a one-time `terraform state mv` per resource (integration, IAM role + policy, schema, table, stage, loader role + user, `grant_account_role`, and the 5 privilege grants) — **not** a destroy/recreate. The module reproduces every name and comment byte-for-byte so the post-move `terraform plan` is "No changes" (the gate before applying). One benign exception: the EIA stage's `file_format` shows a perpetual in-place diff from the snowflake provider normalizing the string (`NULL_IF = []`, lower-case `true`) — pre-existing, harmless, identical to the old inline config.
+- The module uses two providers (aws + snowflake); it declares `required_providers` and inherits the default provider configs from `infra/core`.
+
+---
+
+# Pipeline-specific decisions
 
 ## EIA pipeline
 
@@ -450,5 +473,55 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 - API-level retry inside the client on HTTP 502/503/504 with backoff (10 s, 20 s, 30 s).
 - Late-arriving EIA corrections caught by the 7-day rolling lookback.
 - Total outage (0 rows consolidated) → `ValueError` → failed async invocation → on-failure destination → SNS alert.
-- Run-report email published on every completed run (succeeded/skipped counts, skip reasons, 30-day skip history).
+- `run_report.json` written on every completed run; the daily digest (decision 8) turns it into a combined email.
 - Source-of-truth integrity preserved via append-only S3 partitions; downstream de-dup is non-destructive.
+
+---
+
+## NOAA pipeline
+
+Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-summaries`) for 40 stations grouped under 4 balancing authorities (`CISO, PJM, ERCO, MISO`), daily. Mirrors the EIA pipeline's shape; only the genuinely source-specific decisions are recorded here.
+
+### NOAA-1. Reuse the EIA pipeline shape; no API key
+
+**Chosen:** Same single-Lambda, EventBridge-direct, fan-out → consolidate → `COPY INTO` → write-report orchestration as EIA (EIA-1), copy-adapted. The NCEI `data/v1` endpoint needs **no token**, so NOAA drops the api-key SSM parameter and the `ssm.get_parameter(API_KEY)` fetch entirely — only the Snowflake loader key remains.
+
+**Why:** the EIA pipeline was already factored so that only `client.py` + `schema.py` are source-specific; the handler is copy-adapted (the ~90% overlap isn't worth a shared orchestrator). No API key means one fewer secret and IAM statement.
+
+### NOAA-2. Fan-out unit = BA; all of a BA's stations in one batched NCEI request
+
+**Chosen:** The fan-out unit is the **BA** (one raw `<ba>.json` per BA, mirroring EIA), and the BA→station map (~10 stations each) lives in `client.py`'s `STATIONS`. The client fetches all of a BA's stations in **one batched request** (comma-separated `stations=`), tagging every row with its `ba`.
+
+**Alternatives considered:**
+- **One request per station** (as the exploratory notebook did). Works, but multiplies request count, and under any concurrency NCEI throttles per-IP (503 → client back-offs) — see NOAA-5's backfill note.
+- **Unit = station** (one raw file per station). Breaks the EIA `{"units":[...]}` event contract and the per-unit fault-tolerance granularity, and makes the `ba` join key implicit.
+
+**Why:** batched-per-BA is data-identical to per-station (NCEI returns the same rows), keeps the raw layout and event contract identical to EIA, and minimizes request volume against a fragile API.
+
+**Trade-offs:** a single failing station fails its whole BA (coarse, but logged and skip-reported); the `ba` tagging is added client-side, not from the API.
+
+### NOAA-3. Wide schema, 13 datatypes, grain `(ba, station, date)`
+
+**Chosen:** One row per `(ba, station, date)`, **wide** — one column per datatype: `TMAX, TMIN, TAVG, PRCP, SNOW, SNWD, AWND, WSF2, WSF5, WDF2, RHAV, ASLP, ADPT` (metric units) plus `ingestion_date`. Absent datatypes land null. Loaded into `ZEUS_DEV.NOAA.NOAA_GRID`.
+
+**Alternatives considered:**
+- **The notebook's 8 datatypes** (`TMAX,TMIN,PRCP,AWND,RHAV,ASLP,ADPT,WSF5`). The chosen set adds `TAVG` (demand/degree-days), `SNOW`/`SNWD` (winter demand), and `WSF2`/`WDF2` (wind gusts/direction) for the weather↔energy use case.
+- **Long format** (one row per station/date/datatype). Mirrors EIA's tall shape but multiplies row count; wide is the natural shape for daily station weather and joins cleanly to grid data on `ba`.
+
+**Why:** wide is sparse-tolerant (Parquet/Snowflake store nulls cheaply) and matches how the data is consumed (weather features per station-day). `USE_LOGICAL_TYPE = TRUE` is required for the `date` column to load as a real DATE (raw INT32 otherwise).
+
+### NOAA-4. Rolling 7-day lookback + `ingestion_date` (same contract as EIA-5)
+
+**Chosen:** Each run pulls the last 7 days (`lookback_window_dates`) into today's partition; append-only, deduped downstream on `(date, station)` keeping the latest `ingestion_date`.
+
+**Why:** NCEI daily-summaries are **provisional and lag** — recent days arrive late (the smoke test's 7-day window only had data through 3 days prior) and get QC-revised. The overlap catches both, exactly as EIA's lookback catches EIA's corrections. Schedule is `cron(30 7 * * ? *)`, staggered 30 min after EIA so the two daily runs don't overlap.
+
+### NOAA-5. Historical backfill: two-phase, day-partitioned, run off-peak
+
+**Chosen:** `backfill/noaa/` mirrors `backfill/eia/`: `run.py extract` fetches per BA-year and writes one raw JSON per `(BA, observation-day)` (partition **backdated** to the observation date); `run.py transform` writes one curated Parquet per observation-day; `snowflake_load.py` whole-stage `COPY`s. Both phases are idempotent (skip already-written keys) so a failed run resumes.
+
+**Why / the lesson:**
+- This produces the same per-observation-day S3 layout as the daily pipeline (and as EIA's backfill), not one blob in the run-date partition — so the curated layer is uniform across backfill and daily runs.
+- **The NCEI API is fragile during peak hours.** Concurrent extract (`--concurrency > 1`) trips per-IP throttling → 503 back-offs that stall the run; a single request is ~1.4 s healthy but 6+ min when throttled. Run the backfill **off-peak (night UTC)**; per-year idempotent resume means an interrupted run picks up where it stopped. The daily Lambda collects data going forward regardless.
+
+**Trade-offs:** the backfill is the heaviest S3 user (~6,000 curated days + ~20k raw `(BA,day)` files for 2010→now, ~60k requests, ~$0.15) — by design, matching EIA's per-day layout.

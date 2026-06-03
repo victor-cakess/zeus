@@ -1,6 +1,6 @@
 """Phase B: per day, consolidate that day's raw JSON files (all BAs) into one
 Snappy Parquet in the curated layer — same schema/normalization as the daily
-transform Lambda, minus its report/SNS/alert logic.
+ingest Lambda, minus its report/SNS/alert logic.
 
 Idempotency: list each year's curated prefix once, skip days whose parquet exists.
 Days with no raw data write nothing.
