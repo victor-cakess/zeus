@@ -94,8 +94,9 @@ terraform apply
 terraform output                          # bucket_name, bucket_arn, alerts_topic_arn, snowflake_warehouse_name, snowflake_account, snowflake_database_name
 
 # Terraform — EIA pipeline
-# The build step runs `uv pip install --python python3.12`, so uv AND python3.12
-# must be on PATH (activate the project venv first).
+# The build step runs `uv pip install --python python3.12` via Terraform's /bin/sh
+# provisioner, so uv AND python3.12 must be REAL binaries on PATH. If apply fails
+# with "/bin/sh: uv: not found", see "Build troubleshooting" under Working norms.
 cd infra/pipelines/eia
 terraform init
 terraform plan
@@ -161,6 +162,14 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_eia_loader.p8 \
 - Secrets never in code, never in `terraform.tfvars`, never in `terraform.tfstate`. SSM `SecureString` with `lifecycle.ignore_changes = [value]`; rotate via `aws ssm put-parameter`. Snowflake auth follows this too: only the loader's **public** key is in Terraform (`var.eia_loader_public_key`); the private key lives in SSM.
 - Lambda packaging is ZIP built locally via `uv pip install --python python3.12 --target …`, then **uploaded to S3** and referenced by `s3_bucket`/`s3_key` (the package is ~49 MiB zipped, over the 50 MiB direct-upload limit). Don't rely on the project venv for the build; `unset VIRTUAL_ENV` first. `uv` and `python3.12` must be on PATH when running `terraform apply`. The `null_resource.build` trigger fingerprints `requirements.txt` + `**/*.py` under both the Lambda's `src_dir` and `src/shared/`, so any change forces a rebuild. `snowflake-connector-python` pins `cryptography`/`pyOpenSSL` (loose upstream bounds otherwise resolve to an import-incompatible pair).
 - Event payload contract: EventBridge invokes the Lambda directly with `{"units": [...]}`; the handler reads `event["units"]`. The same contract works for any fan-out source.
+
+### Build troubleshooting
+- **`/bin/sh: uv: not found` during `terraform apply`.** The Lambda build is a `local-exec` provisioner (`infra/modules/lambda_job/main.tf`) that Terraform runs under **`/bin/sh`** — a non-interactive, non-login shell that does **not** source your shell config. If `uv` is a shim/alias/shell function, or lives only on your interactive shell's PATH (common with version managers or a venv that doesn't ship `uv`), the build fails with `/bin/sh: uv: not found` **even though `uv` works fine in your terminal**. The fix is to put a **real `uv` binary** on a directory that's already on PATH for non-interactive shells — `~/.local/bin` works:
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh   # installs uv + uvx to ~/.local/bin
+  uv --version                                       # must resolve as a plain binary, not a shim
+  ```
+  Then re-run `terraform apply` (a half-failed apply just continues — it recreates the build and the remaining resources). `python3.12` must likewise be a real binary on PATH; the project's `.venv/bin/python3.12` satisfies that with the venv active. The build does `unset VIRTUAL_ENV` itself, so don't rely on the venv providing `uv`.
 
 ### S3 layout
 - Two layers: `raw/<source>/` (one JSON file per atomic unit, e.g. per BA) and `curated/<source>/` (one consolidated Parquet per day). A `reports/<source>/` prefix holds per-run JSON reports.

@@ -64,3 +64,30 @@ def format_email(
             lines.append(f"  {unit} — {count} days")
 
     return subject, "\n".join(lines)
+
+
+def format_digest(
+    date_str: str, sections: list[tuple], history_days: int
+) -> tuple[str, str]:
+    """Combine one day's per-source run into a single email.
+
+    `sections` is a list of (source, run_report | None, history) — one per source.
+    A None run_report means that pipeline wrote no report today (it crashed and its
+    own on-failure alert already fired); it's surfaced here, not hidden.
+    """
+    summary = []
+    bodies = []
+    for source, run_report, history in sections:
+        label = source.upper()
+        if run_report is None:
+            summary.append(f"{label} no report")
+            bodies.append(f"{label}: no run report for {date_str} (see failure alert).")
+            continue
+        n_ok = len(run_report["succeeded"])
+        n_skip = len(run_report["skipped"])
+        summary.append(f"{label} {n_ok} ok / {n_skip} skipped")
+        _, body = format_email(run_report, history, source, history_days)
+        bodies.append(body)
+
+    subject = f"Zeus daily {date_str} — " + " | ".join(summary)
+    return subject, "\n\n".join(bodies)
