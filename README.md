@@ -230,15 +230,16 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 ## 11. Cross-Lambda Python helpers in `src/shared/`
 
 **Chosen:** A `src/shared/` package vendored into the Lambda's build dir at the zip root. Modules:
-- `paths.py` — single source of truth for the S3 layout (`raw_key`, `raw_prefix`, `curated_prefix`, `report_key`).
+- `paths.py` — single source of truth for the S3 layout (`raw_key`, `raw_prefix`, `curated_prefix`, `report_key`) and its inverse `partition_date(key)`.
 - `s3_io.py` — boto3 wrappers (`put_json`, `put_bytes`, `get_json`, `list_keys`, `iter_objects`).
 - `ssm.py` — module-cached `get_parameter`.
 - `sns.py` — `publish(topic_arn, subject, message)`.
-- `snowflake_io.py` — `copy_into(...)`: key-pair connection, run one statement, return rows loaded (caller builds the SQL).
+- `snowflake_io.py` — `copy_into(...)` (key-pair connection, run one statement, return rows loaded) and `copy_statement(...)` (the one `COPY INTO … PARQUET` template builder).
 - `time_window.py` — `today_utc()`, `lookback_window(today, days)` (hourly `YYYY-MM-DDTHH`, EIA), and `lookback_window_dates(today, days)` (date `YYYY-MM-DD`, NOAA).
 - `report.py` — source-agnostic run-report build, per-source `format_email`, `format_digest` (combines all sources), and `skip_history`. Used by both ingest Lambdas and the digest.
+- `ingest.py` — the shared daily orchestrator (`run_ingest`, `config_from_env`); each `handler.py` is a thin shim injecting the source's `fetch_fn`/`window_fn`/`schema`.
 
-Handlers import as `from shared import paths, report, s3_io, snowflake_io, ssm, time_window`. The build step in `modules/lambda_job/` copies `src/shared/` into `${build_dir}/shared` and fingerprints `**/*.py` under both `var.src_dir` and `var.shared_dir` in `null_resource.triggers`, so any edit forces a rebuild. `report.py` started as an EIA sibling module and was promoted to `src/shared/` once a second source needed it — it was already source-agnostic (takes `source` as a param).
+Handlers import the slices they need (e.g. `from shared import ingest, ssm, time_window`). The build step in `modules/lambda_job/` copies `src/shared/` into `${build_dir}/shared` and fingerprints `**/*.py` under both `var.src_dir` and `var.shared_dir` in `null_resource.triggers`, so any edit forces a rebuild (and a `src/shared/` change rebuilds every Lambda). `report.py` and the orchestration in `ingest.py` started as EIA-sibling code and were promoted to `src/shared/` once a second source needed them.
 
 **Alternatives considered:**
 - **Lambda Layer.** Rejected: another infra resource to manage and version-bump, for negligible size savings at this footprint.
@@ -484,9 +485,9 @@ Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-
 
 ### NOAA-1. Reuse the EIA pipeline shape; no API key
 
-**Chosen:** Same single-Lambda, EventBridge-direct, fan-out → consolidate → `COPY INTO` → write-report orchestration as EIA (EIA-1), copy-adapted. The NCEI `data/v1` endpoint needs **no token**, so NOAA drops the api-key SSM parameter and the `ssm.get_parameter(API_KEY)` fetch entirely — only the Snowflake loader key remains.
+**Chosen:** Same single-Lambda, EventBridge-direct, fan-out → consolidate → `COPY INTO` → write-report orchestration as EIA (EIA-1), via the shared `src/shared/ingest.py` orchestrator. The NCEI `data/v1` endpoint needs **no token**, so NOAA drops the api-key SSM parameter and the `ssm.get_parameter(API_KEY)` fetch entirely — only the Snowflake loader key remains.
 
-**Why:** the EIA pipeline was already factored so that only `client.py` + `schema.py` are source-specific; the handler is copy-adapted (the ~90% overlap isn't worth a shared orchestrator). No API key means one fewer secret and IAM statement.
+**Why:** the EIA pipeline was already factored so that only `client.py` + `schema.py` are source-specific; both handlers are now ~12-line shims over `ingest.run_ingest`, injecting the source's `fetch_fn` (NOAA's needs no api key) and `window_fn` (daily vs hourly). No API key means one fewer secret and IAM statement.
 
 ### NOAA-2. Fan-out unit = BA; all of a BA's stations in one batched NCEI request
 

@@ -1,9 +1,12 @@
 import time
 
 import requests
+from schema import DATA_TYPES
 
 BASE_URL = "https://www.ncei.noaa.gov/access/services/data/v1"
-DATA_TYPES = "TMAX,TMIN,TAVG,PRCP,SNOW,SNWD,AWND,WSF2,WSF5,WDF2,RHAV,ASLP,ADPT"
+# Single source of truth for the datatype set is schema.DATA_TYPES; the NCEI request
+# wants it as a comma-separated string.
+DATA_TYPES_PARAM = ",".join(DATA_TYPES)
 
 # Balancing authority → its weather stations. The BA codes match EIA's so weather
 # joins to grid data on `ba` downstream; every fetched row is tagged with its BA.
@@ -65,7 +68,7 @@ def fetch_unit(unit: str, start: str, end: str, retries: int = 3) -> list[dict]:
     per BA is what the NCEI API supports and what avoids per-station throttling."""
     params = {
         "dataset": "daily-summaries",
-        "dataTypes": DATA_TYPES,
+        "dataTypes": DATA_TYPES_PARAM,
         "stations": ",".join(STATIONS[unit]),
         "startDate": start,
         "endDate": end,
