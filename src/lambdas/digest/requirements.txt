@@ -1,0 +1,3 @@
+# No third-party deps: the digest only reads run reports from S3 and publishes to
+# SNS, both via boto3 (already in the Lambda runtime). The shared/ package is copied
+# in at build time but only its boto3/stdlib modules are imported here.

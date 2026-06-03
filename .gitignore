@@ -18,8 +18,6 @@ profiles.yml
 terraform.tfvars
 *.secrets.tfvars
 infra/build/
-infra/modules/aws/**/build/
-infra/modules/aws/build/
 
 # Data / pipelines
 extraction/
@@ -31,5 +29,6 @@ ADR.md
 temp_decisions
 snowflake.md
 
-sf_eia_loader.p8
-sf_eia_loader.pub
+# Snowflake loader key-pairs — private keys never committed (set in SSM out-of-band)
+*.p8
+sf_*_loader.pub
