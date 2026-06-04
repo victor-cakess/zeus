@@ -22,7 +22,7 @@ infra/
     eia/                          # EIA pipeline root: SSM (api key + snowflake key) + lambda_job + EventBridge + on-failure config
     noaa/                         # NOAA pipeline root: SSM (snowflake key only — NCEI needs no api key) + lambda_job + EventBridge + on-failure config
     digest/                       # digest pipeline root: lambda_job + daily EventBridge (reads all sources' run reports, emails one summary)
-      backend.tf, providers.tf, remote_state.tf, locals.tf, main.tf, outputs.tf   # (same file set in each pipeline root)
+      backend.tf, providers.tf, variables.tf, remote_state.tf, locals.tf, main.tf, outputs.tf   # (same file set in each pipeline root)
   build/                          # gitignored — Lambda zip artifacts (one dir + zip per Lambda)
 src/
   shared/                         # importable by every Lambda; copied into each build at zip root
@@ -38,9 +38,9 @@ src/
     noaa/ingest/                  # NOAA Lambda: handler.py + client.py (NCEI daily-summaries, batched stations, no token) + schema.py (wide, 13 datatypes) + requirements.txt
     digest/                       # digest Lambda: handler.py reads each source's run_report.json, sends one combined email (requirements.txt: boto3 only)
 extraction/                       # gitignored, exploratory notebooks
-backfill/                         # one-off historical backfill scripts (reuse src/ via _bootstrap.py)
-  eia/                            # full fetch→raw→curated→COPY backfill: run.py (extract/transform) + fetch.py + extract.py + transform.py + snowflake_load.py
-  noaa/                           # same two-phase pattern for NOAA (day-partitioned, backdated, idempotent resume)
+backfill/                         # one-off historical backfill scripts (reuse src/ via _bootstrap.py); see backfill/README.md
+  eia/                            # fetch→raw→curated→COPY: run.py (extract/transform) + fetch.py + extract.py + transform.py + snowflake_load.py + units.py (BA list) + _bootstrap.py + logconf.py
+  noaa/                           # same two-phase pattern (run.py/fetch/extract/transform/snowflake_load + _bootstrap + logconf; stations from src client, no units.py); day-partitioned, backdated, idempotent resume
 README.md                         # project overview + architectural decisions
 ```
 
@@ -50,7 +50,7 @@ README.md                         # project overview + architectural decisions
 
 - **Trigger:** EventBridge rule `zeus-dev-eia-daily` fires `cron(0 7 * * ? *)` (07:00 UTC = 04:00 sa-east-1). It invokes the Lambda **directly and asynchronously** with the payload `{"units": [...]}` (the full BA list from `infra/pipelines/eia/locals.tf`).
 - **Worker:** a single Lambda `zeus-dev-eia-ingest` (Python 3.12, 1024 MB, 300 s timeout, deployed via S3). One invocation does the whole run:
-  1. Fans out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS=20`), writing one raw JSON file per BA.
+  1. Fans out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS` env var, default 20), writing one raw JSON file per BA.
   2. Reads back the day's raw partition and consolidates every row into one Snappy-compressed Parquet in the curated layer.
   3. Runs `COPY INTO ZEUS_DEV.EIA.EIA_GRID` from the external stage to load that day's Parquet into Snowflake (Snowflake reads S3 directly via the storage integration).
   4. Writes a run report (`run_report.json`) to the reports layer. It does **not** email — the daily digest Lambda emails the combined summary (see below).
@@ -223,3 +223,9 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
 - For pipeline changes: invoke the Lambda once with the full units list and confirm all expected raw + curated partitions land.
 - For Snowflake-touching changes: confirm rows land in the source's landing table (`ZEUS_DEV.EIA.EIA_GRID` / `ZEUS_DEV.NOAA.NOAA_GRID`) with real timestamps/dates (`period` / `date`), not "Invalid date".
 - No hardcoded values unless explicitly agreed.
+
+## Tech debt
+
+Known issues to fix later. Not blocking; documented here so they aren't lost.
+
+- **Duplicate NOAA station ID `USW00014733` across two BAs.** In `src/lambdas/noaa/ingest/client.py`'s `STATIONS` map, the same GHCND id `USW00014733` is listed under both PJM (line 30, labeled "Baltimore" — correct; this is Baltimore-Washington Intl / BWI) and MISO (line 53, labeled "Indianapolis" — **wrong id**). So MISO silently ingests Baltimore's weather tagged as Indianapolis, and the 40-station map has only 39 unique stations. It does **not** corrupt the grain (rows are keyed `(ba, station, date)` and `ba` is tagged client-side), so MISO and PJM each get a valid row for that station — but one of MISO's 10 stations is geographically wrong. **Fix:** replace MISO's `USW00014733` with the real Indianapolis Intl id (`USW00093819`), then backfill/re-ingest MISO so the corrected station's history lands. Until then, treat MISO's "Indianapolis" weather as duplicate Baltimore data.
