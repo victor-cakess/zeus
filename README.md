@@ -305,7 +305,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 
 ### EIA-1. Orchestration: a single Lambda with an in-process thread fan-out
 
-**Chosen:** One Lambda, `zeus-dev-eia-ingest`, invoked directly by EventBridge. It fans out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS=20`), writes one raw JSON file per BA, then — in the same invocation — reads back the day's raw partition and consolidates it into a single curated Parquet, writes a run report, and emails the summary.
+**Chosen:** One Lambda, `zeus-dev-eia-ingest`, invoked directly by EventBridge. It fans out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS` env var, default 20), writes one raw JSON file per BA, then — in the same invocation — reads back the day's raw partition and consolidates it into a single curated Parquet and writes a run report. It does **not** email — the daily digest Lambda (decision 8) sends the combined summary.
 
 **Alternatives considered:**
 - **Step Functions `Map` fan-out + a separate consolidation Lambda.** This was the previous architecture: a `STANDARD` workflow with a `Map` state (one extract Lambda per BA) feeding a `Consolidate` task. Replaced because the orchestration outweighed the workload — the full run takes ~12.5 s, comfortably inside a single Lambda's limits, and a state machine plus a second Lambda plus their IAM roles and the failure-alert rule were more moving parts than the job warranted.
@@ -318,7 +318,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 - Far less infrastructure: no state machine, no second Lambda, no extra IAM role, no execution-status alert rule.
 
 **Trade-offs:**
-- No Step Functions execution graph in the console. Per-run visibility is the run-report email plus CloudWatch logs/metrics; per-BA forensics means reading logs rather than clicking a branch.
+- No Step Functions execution graph in the console. Per-run visibility is the daily digest email plus CloudWatch logs/metrics; per-BA forensics means reading logs rather than clicking a branch.
 - Retry is whole-run, not per-BA. At ~12.5 s a full re-run is cheap, and per-BA HTTP errors are already retried inside the client.
 
 ---
@@ -406,7 +406,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 **Why:**
 - Confirmed via direct EIA API query (`total: "0"`) across consecutive days: these 10 BAs consistently return no data on the `electricity/rto/fuel-type-data` endpoint. They exist in the EIA system but don't report hourly fuel-type data via Form EIA-930.
 - Keeping them generated empty `[]` files and a daily skip entry for no signal.
-- Per-BA skip (rather than hard-fail) keeps one flaky or empty BA from sinking the entire daily run; the skip is recorded in the run report and surfaced in the email, including a 30-day skip-frequency history.
+- Per-BA skip (rather than hard-fail) keeps one flaky or empty BA from sinking the entire daily run; the skip is recorded in the run report and surfaced in the daily digest email, including a 30-day skip-frequency history.
 
 **Trade-offs:**
 - If EIA begins publishing data for one of the removed BAs, it goes unnoticed until the list is manually updated.
@@ -416,7 +416,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 
 ### EIA-8. Consolidation: in-process, after the fan-out
 
-**Chosen:** After the thread fan-out finishes, the same Lambda lists the day's `raw/eia/...` partition, reads every file, normalizes each row (`schema.normalize_row`), and writes one Snappy-compressed Parquet to `curated/eia/...`. It then writes the run report and emails the summary, and finally raises `ValueError` if zero rows were consolidated.
+**Chosen:** After the thread fan-out finishes, the same Lambda lists the day's `raw/eia/...` partition, reads every file, normalizes each row (`schema.normalize_row`), and writes one Snappy-compressed Parquet to `curated/eia/...`. It then writes the run report, and finally raises `ValueError` if zero rows were consolidated.
 
 **Alternatives considered:**
 - **A separate consolidation Lambda** (the previous `transform` worker invoked by a Step Functions `Consolidate` task). Removed with the orchestrator — see EIA-1.
@@ -448,7 +448,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 - Shortest path that lands rows in the same invocation, with no new AWS runtime infrastructure — just the storage integration, an IAM role, and an SSM secret.
 - `FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE)` is **required**: without it Snowflake reads the Parquet `period` as a raw INT64 and the timestamp loads as "Invalid date".
 - Snowflake's per-file load metadata makes a same-day re-run idempotent (the already-loaded Parquet is skipped); cross-day overlap is the intended duplication, resolved downstream.
-- A load failure is recorded in the run report, emailed, then re-raised so the async on-failure destination alerts (decision 8) — the curated Parquet stays safe in S3 and the load is re-runnable.
+- A load failure is recorded in the run report, then re-raised so the async on-failure destination alerts (decision 8) — the curated Parquet stays safe in S3 and the load is re-runnable.
 
 **Trade-offs:**
 - The append-only landing table carries ~7× row duplication from the lookback overlap; the deduped view is dbt's job (not yet built).
