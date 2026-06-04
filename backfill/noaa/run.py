@@ -30,7 +30,13 @@ def _parse_args(argv):
         p.add_argument("--end", type=date.fromisoformat,
                        default=datetime.now(timezone.utc).date(),
                        help="inclusive end date YYYY-MM-DD (default: today UTC)")
-        p.add_argument("--concurrency", type=int, default=4)
+        # NCEI tolerates concurrent requests (verified: 2 BAs in parallel finished in
+        # ~one request's time, not 2x). extract = one wide request per BA → default 4
+        # (one thread per BA, whole backfill in ~one ~520s wave). transform is S3-only.
+        p.add_argument("--concurrency", type=int,
+                       default=4 if phase == "extract" else 10,
+                       help="parallel workers (extract default 4: one NCEI request "
+                            "per BA, run in parallel; transform default 10: S3-only)")
     return parser.parse_args(argv)
 
 
