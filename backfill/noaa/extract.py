@@ -1,11 +1,17 @@
-"""Phase A: fetch full history per BA (its station list), split rows by day, write
-one raw JSON per (BA, day) — identical layout to the daily pipeline. The partition
-is backdated to each row's observation date (raw["DATE"]).
+"""Phase A: fetch full history per BA (its station list) in ONE wide NCEI request,
+split rows by day, write one raw JSON per (BA, day) — identical layout to the daily
+pipeline. The partition is backdated to each row's observation date (raw["DATE"]).
 
-Idempotency: list each year's raw prefix once, skip puts for keys already present.
-Empty (BA, year) ranges write nothing (and are re-probed cheaply on resume).
+NCEI's data/v1 endpoint has a ~fixed per-request latency: a 1-month, a 1-station and
+a full 16-year/10-station request all cost ~the same ~520s. So the backfill fetches
+each BA's whole range in a single request rather than per-year — 4 requests instead
+of 64, ~9x faster end to end.
+
+Idempotency: list the existing raw keys in range once, skip puts for keys already
+present. A BA that returns no rows writes nothing (re-probed cheaply on resume).
 """
 
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -13,22 +19,16 @@ from datetime import date
 import _bootstrap  # noqa: F401  (sets sys.path)
 from fetch import fetch_with_retry
 from shared import paths, s3_io
+from tqdm import tqdm
 
 
-def _year_window(year: int, start: date, end: date) -> tuple[str, str]:
-    """NCEI start/end (YYYY-MM-DD) for `year`, clamped to the overall range."""
-    lo = max(date(year, 1, 1), start)
-    hi = min(date(year, 12, 31), end)
-    return lo.isoformat(), hi.isoformat()
-
-
-def _extract_unit_year(unit, year, window, existing, bucket, source, logger) -> Counter:
-    start, end = window
-    print(f"  processing {unit} {year}...", flush=True)
-    rows = fetch_with_retry(unit, start, end)
+def _extract_unit(unit, start: date, end: date, existing, bucket, source, logger) -> Counter:
+    logger.info("FETCHING unit=%s window=%s..%s", unit, start, end)
+    t0 = time.monotonic()
+    rows = fetch_with_retry(unit, start.isoformat(), end.isoformat(), logger, unit)
+    elapsed = time.monotonic() - t0
     if not rows:
-        logger.info("EMPTY unit=%s year=%s", unit, year)
-        print(f"  {unit} {year} done (no data)", flush=True)
+        logger.info("EMPTY unit=%s elapsed=%.1fs", unit, elapsed)
         return Counter(empty_units=1)
 
     by_day: dict[date, list[dict]] = defaultdict(list)
@@ -45,57 +45,45 @@ def _extract_unit_year(unit, year, window, existing, bucket, source, logger) -> 
         written += 1
 
     logger.info(
-        "OK unit=%s year=%s rows=%d days=%d written=%d skipped=%d",
-        unit, year, len(rows), len(by_day), written, skipped,
+        "OK unit=%s rows=%d days=%d written=%d skipped=%d elapsed=%.1fs",
+        unit, len(rows), len(by_day), written, skipped, elapsed,
     )
-    print(f"  {unit} {year} done ({written} days, {len(rows)} rows)", flush=True)
     return Counter(units_with_data=1, rows=len(rows), raw_written=written, raw_skipped=skipped)
 
 
 def run(units, start: date, end: date, bucket, source, concurrency, logger):
-    overall = Counter()
+    # Idempotency: one pass listing every existing raw key in range (union per year).
+    existing = set()
     for year in range(start.year, end.year + 1):
-        window = _year_window(year, start, end)
-        existing = set(s3_io.list_keys(bucket, f"raw/{source}/ingestion_year={year:04d}/"))
-        logger.info("YEAR %s window=%s existing_keys=%d", year, window, len(existing))
-        print(f"[{year}] {len(units)} BAs ({window[0]} .. {window[1]})", flush=True)
+        existing |= set(s3_io.list_keys(bucket, f"raw/{source}/ingestion_year={year:04d}/"))
+    logger.info("RANGE %s..%s units=%d existing_keys=%d", start, end, len(units), len(existing))
 
-        counts = Counter()
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {
-                pool.submit(
-                    _extract_unit_year,
-                    unit, year, window, existing, bucket, source, logger,
-                ): unit
-                for unit in units
-            }
-            for future in as_completed(futures):
-                unit = futures[future]
-                try:
-                    counts += future.result()
-                except Exception:
-                    logger.exception("FAILED unit=%s year=%s", unit, year)
-                    counts["failed_units"] += 1
-                    print(f"  {unit} {year} FAILED — see log", flush=True)
-
-        logger.info(
-            "YEAR %s SUMMARY units_with_data=%d empty=%d failed=%d "
-            "raw_written=%d raw_skipped=%d rows=%d",
-            year, counts["units_with_data"], counts["empty_units"], counts["failed_units"],
-            counts["raw_written"], counts["raw_skipped"], counts["rows"],
-        )
-        print(
-            f"[{year}] done — {counts['raw_written']} written, "
-            f"{counts['empty_units']} empty, {counts['failed_units']} failed",
-            flush=True,
-        )
-        overall += counts
+    overall = Counter()
+    # One bar over the BAs (each is a single wide request) — the "is it working"
+    # signal. Per-request detail (FETCHING/OK/EMPTY/RETRY) goes to the log file.
+    bar = tqdm(total=len(units), desc="extract", unit="BA")
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(_extract_unit, unit, start, end, existing, bucket, source, logger): unit
+            for unit in units
+        }
+        for future in as_completed(futures):
+            unit = futures[future]
+            try:
+                overall += future.result()
+            except Exception:
+                logger.exception("FAILED unit=%s", unit)
+                overall["failed_units"] += 1
+                tqdm.write(f"  {unit} FAILED — see log")
+            bar.update(1)
+            bar.set_postfix(written=overall["raw_written"], failed=overall["failed_units"])
+    bar.close()
 
     logger.info(
-        "EXTRACT SUMMARY years=%d units_with_data=%d empty=%d failed=%d "
+        "EXTRACT SUMMARY units_with_data=%d empty=%d failed=%d "
         "raw_written=%d raw_skipped=%d rows=%d",
-        end.year - start.year + 1, overall["units_with_data"], overall["empty_units"],
-        overall["failed_units"], overall["raw_written"], overall["raw_skipped"], overall["rows"],
+        overall["units_with_data"], overall["empty_units"], overall["failed_units"],
+        overall["raw_written"], overall["raw_skipped"], overall["rows"],
     )
     print(
         f"\nEXTRACT DONE — {overall['raw_written']} objects written, "

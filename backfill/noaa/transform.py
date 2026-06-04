@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from schema import SCHEMA, normalize_row
 from shared import paths, s3_io
+from tqdm import tqdm
 
 
 def _days_in_year(year: int, start: date, end: date):
@@ -46,18 +47,20 @@ def _transform_day(day, existing, bucket, source, logger) -> Counter:
     pq.write_table(table, buf, compression="snappy")
     s3_io.put_bytes(bucket, out_key, buf.getvalue())
     logger.info("OK day=%s rows=%d key=%s", day, len(rows), out_key)
-    print(f"  {day} done ({len(rows)} rows)", flush=True)
     return Counter(written=1, rows=len(rows))
 
 
 def run(start: date, end: date, bucket, source, concurrency, logger):
     overall = Counter()
+    # One bar over every day in range — the terminal "is it working" signal.
+    # Per-day detail (OK/SKIP/EMPTY) goes to the log file via `logger`.
+    bar = tqdm(total=(end - start).days + 1, desc="transform", unit="day")
     for year in range(start.year, end.year + 1):
         existing = set(
             s3_io.list_keys(bucket, f"curated/{source}/ingestion_year={year:04d}/")
         )
         logger.info("YEAR %s existing_parquets=%d", year, len(existing))
-        print(f"[{year}] transforming days...", flush=True)
+        bar.set_description(f"transform {year}")
 
         counts = Counter()
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -72,19 +75,20 @@ def run(start: date, end: date, bucket, source, concurrency, logger):
                 except Exception:
                     logger.exception("FAILED day=%s", day)
                     counts["failed"] += 1
-                    print(f"  {day} FAILED — see log", flush=True)
+                    tqdm.write(f"  {day} FAILED — see log")
+                bar.update(1)
+                bar.set_postfix(
+                    written=overall["written"] + counts["written"],
+                    failed=overall["failed"] + counts["failed"],
+                )
 
         logger.info(
             "YEAR %s SUMMARY parquets_written=%d skipped=%d empty=%d failed=%d rows=%d",
             year, counts["written"], counts["skipped"], counts["empty"],
             counts["failed"], counts["rows"],
         )
-        print(
-            f"[{year}] done — {counts['written']} parquets, "
-            f"{counts['skipped']} skipped, {counts['empty']} empty, {counts['failed']} failed",
-            flush=True,
-        )
         overall += counts
+    bar.close()
 
     logger.info(
         "TRANSFORM SUMMARY years=%d parquets_written=%d skipped=%d empty=%d failed=%d rows=%d",

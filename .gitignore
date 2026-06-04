@@ -32,3 +32,6 @@ snowflake.md
 # Snowflake loader key-pairs — private keys never committed (set in SSM out-of-band)
 *.p8
 sf_*_loader.pub
+
+snowflake-energy-plan.md
+business_justification.md
