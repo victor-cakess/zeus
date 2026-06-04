@@ -481,7 +481,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 
 ## NOAA pipeline
 
-Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-summaries`) for 40 stations grouped under 4 balancing authorities (`CISO, PJM, ERCO, MISO`), daily. Mirrors the EIA pipeline's shape; only the genuinely source-specific decisions are recorded here.
+Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-summaries`) for weather stations grouped under 14 balancing authorities (`CISO, PJM, ERCO, MISO, ISNE, NYIS, SWPP, TVA, SOCO, DUK, FPL, BPAT, PSCO, SRP`; 3–10 stations each), daily. Mirrors the EIA pipeline's shape; only the genuinely source-specific decisions are recorded here.
 
 ### NOAA-1. Reuse the EIA pipeline shape; no API key
 
@@ -491,10 +491,10 @@ Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-
 
 ### NOAA-2. Fan-out unit = BA; all of a BA's stations in one batched NCEI request
 
-**Chosen:** The fan-out unit is the **BA** (one raw `<ba>.json` per BA, mirroring EIA), and the BA→station map (~10 stations each) lives in `client.py`'s `STATIONS`. The client fetches all of a BA's stations in **one batched request** (comma-separated `stations=`), tagging every row with its `ba`.
+**Chosen:** The fan-out unit is the **BA** (one raw `<ba>.json` per BA, mirroring EIA), and the BA→station map (3–10 stations each) lives in `client.py`'s `STATIONS`. The client fetches all of a BA's stations in **one batched request** (comma-separated `stations=`), tagging every row with its `ba`.
 
 **Alternatives considered:**
-- **One request per station** (as the exploratory notebook did). Works, but multiplies request count, and under any concurrency NCEI throttles per-IP (503 → client back-offs) — see NOAA-5's backfill note.
+- **One request per station** (as the exploratory notebook did). Works, but multiplies request count (~7× here) for data-identical results; NCEI can also 429/503 under high concurrency.
 - **Unit = station** (one raw file per station). Breaks the EIA `{"units":[...]}` event contract and the per-unit fault-tolerance granularity, and makes the `ba` join key implicit.
 
 **Why:** batched-per-BA is data-identical to per-station (NCEI returns the same rows), keeps the raw layout and event contract identical to EIA, and minimizes request volume against a fragile API.
@@ -517,12 +517,24 @@ Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-
 
 **Why:** NCEI daily-summaries are **provisional and lag** — recent days arrive late (the smoke test's 7-day window only had data through 3 days prior) and get QC-revised. The overlap catches both, exactly as EIA's lookback catches EIA's corrections. Schedule is `cron(30 7 * * ? *)`, staggered 30 min after EIA so the two daily runs don't overlap.
 
-### NOAA-5. Historical backfill: two-phase, day-partitioned, run off-peak
+### NOAA-5. Historical backfill: two-phase, day-partitioned; force IPv4 from local dev
 
-**Chosen:** `backfill/noaa/` mirrors `backfill/eia/`: `run.py extract` fetches per BA-year and writes one raw JSON per `(BA, observation-day)` (partition **backdated** to the observation date); `run.py transform` writes one curated Parquet per observation-day; `snowflake_load.py` whole-stage `COPY`s. Both phases are idempotent (skip already-written keys) so a failed run resumes.
+**Chosen:** `backfill/noaa/` mirrors `backfill/eia/`: `run.py extract` fetches each BA's whole date range in one batched request and writes one raw JSON per `(BA, observation-day)` (partition **backdated** to the observation date); `run.py transform` writes one curated Parquet per observation-day; `snowflake_load.py` whole-stage `COPY`s. Both phases skip already-written keys for idempotent resume, or take `--overwrite` to re-write them (see NOAA-6).
 
 **Why / the lesson:**
 - This produces the same per-observation-day S3 layout as the daily pipeline (and as EIA's backfill), not one blob in the run-date partition — so the curated layer is uniform across backfill and daily runs.
-- **The NCEI API is fragile during peak hours.** Concurrent extract (`--concurrency > 1`) trips per-IP throttling → 503 back-offs that stall the run; a single request is ~1.4 s healthy but 6+ min when throttled. Run the backfill **off-peak (night UTC)**; per-year idempotent resume means an interrupted run picks up where it stopped. The daily Lambda collects data going forward regardless.
+- **Force IPv4 for NCEI from local dev.** `ncei.noaa.gov` is dual-stack (publishes both A and AAAA records), but the dev machine has a broken IPv6 route; Python's `urllib3` prefers IPv6 and stalls **~10 min/request** on the dead route, while `curl` dodges it via Happy Eyeballs and the Lambda's AWS network is unaffected. `run.py` sets `urllib3_cn.allowed_gai_family = lambda: socket.AF_INET`, cutting a request from ~10 min to **~2 s (~300×)**. This was previously misdiagnosed as NCEI peak-hour throttling and "run off-peak" — it was the IPv6 stall the whole time (a payload-independent ~520 s "latency" is the tell: it's connect time, not transfer). NCEI can still 429/503 under heavy concurrency, which the `fetch.py` retry wrapper backs off on.
 
-**Trade-offs:** the backfill is the heaviest S3 user (~6,000 curated days + ~20k raw `(BA,day)` files for 2010→now, ~60k requests, ~$0.15) — by design, matching EIA's per-day layout.
+**Trade-offs:** the backfill is the heaviest S3 user (~6,000 curated days × 14 BAs ≈ ~84k raw `(BA,day)` files for 2010→now) — by design, matching EIA's per-day layout. S3 request cost is still well under $1.
+
+### NOAA-6. Widening BA coverage (4 → 14) and re-backfilling with `--overwrite`
+
+**Chosen:** Expanded `STATIONS` and `locals.tf` from the original 4 BAs to 14 (added `ISNE, NYIS, SWPP, TVA, SOCO, DUK, FPL, BPAT, PSCO, SRP` — large, geographically distinct EIA BAs), so the weather↔grid join on `ba` covers more of the grid. To add their history to an already-backfilled source, both backfill phases gained an `--overwrite` flag: extract re-fetches every BA, and transform **rebuilds every daily curated Parquet** — because the curated grain bundles all BAs into one file per day, a new BA can't be added without rewriting that day's file.
+
+**Alternatives considered:**
+- **Clean delta load** — write new-BA-only curated files under a distinct filename and `COPY` just those, touching no existing data and creating no duplicates. Correct and zero-duplication, but more one-off code.
+- **Defer history** — let the daily Lambda collect the new BAs forward-only. Rejected: loses the 2010→now history NCEI has and the weather join needs.
+
+**Why overwrite won:** simplest to run with the existing tooling; the landing table is append-only and deduped downstream on `(date, station)`, so re-loading the original 4 BAs as duplicates is tolerated and cleaned in the (future) dbt layer.
+
+**Trade-offs:** the whole-stage re-`COPY` reloads every curated file (new etags), duplicating the original 4 BAs' full history in `NOAA_GRID` until the downstream dedup runs — a deliberate, one-time exception to the backfill's usual "run once" rule.

@@ -59,6 +59,84 @@ STATIONS = {
         "USW00014836",  # Omaha
         "USW00014914",  # Fargo
     ],
+    "ISNE": [
+        "USW00014739",  # Boston, MA
+        "USW00014765",  # Providence, RI
+        "USW00014742",  # Burlington, VT
+        "USW00014740",  # Hartford-Bradley, CT
+        "USW00014758",  # New Haven, CT
+        "USW00014710",  # Manchester, NH
+        "USW00014745",  # Concord, NH
+        "USW00014606",  # Bangor, ME
+        "USW00014605",  # Augusta, ME
+    ],
+    "NYIS": [
+        "USW00094728",  # NYC Central Park
+        "USW00094789",  # JFK
+        "USW00014732",  # LaGuardia
+        "USW00014733",  # Buffalo
+        "USW00014768",  # Rochester
+        "USW00014771",  # Syracuse
+        "USW00004724",  # Niagara Falls
+        "USW00004725",  # Binghamton
+        "USW00004781",  # Islip-LI MacArthur
+    ],
+    "SWPP": [
+        "USW00013968",  # Tulsa, OK
+        "USW00003954",  # Oklahoma City Wiley Post, OK
+        "USW00003928",  # Wichita, KS
+        "USW00013967",  # Olathe/Kansas City, KS
+        "USW00014939",  # Lincoln, NE
+        "USW00013976",  # Lafayette, LA
+    ],
+    "TVA": [
+        "USW00013891",  # Knoxville, TN
+        "USW00013897",  # Nashville, TN
+        "USW00013893",  # Memphis, TN
+        "USW00003856",  # Huntsville, AL
+        "USW00003883",  # Birmingham, AL
+        "USW00003847",  # Crossville, TN
+    ],
+    "SOCO": [
+        "USW00013874",  # Atlanta, GA
+        "USW00003822",  # Savannah, GA
+        "USW00003820",  # Augusta, GA
+        "USW00003813",  # Macon, GA
+        "USW00003883",  # Birmingham, AL
+        "USW00003856",  # Huntsville, AL
+    ],
+    "DUK": [
+        "USW00003812",  # Asheville, NC
+        "USW00003810",  # Hickory, NC
+        "USW00013748",  # Wilmington, NC
+    ],
+    "FPL": [
+        "USW00012839",  # Miami, FL
+        "USW00012836",  # Key West, FL
+        "USW00012844",  # West Palm Beach, FL
+        "USW00012843",  # Vero Beach, FL
+        "USW00012838",  # Melbourne, FL
+    ],
+    "BPAT": [
+        "USW00024229",  # Portland, OR
+        "USW00024233",  # Seattle-Tacoma, WA
+        "USW00024157",  # Spokane, WA
+        "USW00024144",  # Great Falls, MT
+        "USW00024131",  # Boise, ID
+        "USW00024243",  # Wenatchee, WA
+    ],
+    "PSCO": [
+        "USW00003017",  # Denver, CO
+        "USW00023066",  # Grand Junction, CO
+        "USW00023061",  # Alamosa, CO
+    ],
+    "SRP": [
+        "USW00023183",  # Phoenix Sky Harbor, AZ
+        "USW00003184",  # Phoenix Deer Valley, AZ
+        "USW00003185",  # Mesa Falcon Field, AZ
+        "USW00003192",  # Scottsdale, AZ
+        "USW00003162",  # Page, AZ
+    ],
 }
 
 
