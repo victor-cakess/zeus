@@ -10,14 +10,23 @@ SOURCE (default noaa).
 
 import argparse
 import os
+import socket
 import sys
 from datetime import date, datetime, timezone
+
+import urllib3.util.connection as urllib3_cn
 
 import _bootstrap  # noqa: F401  (sets sys.path)
 import client
 import extract
 import logconf
 import transform
+
+# Force IPv4 for all NCEI requests. This machine has a broken IPv6 route to
+# ncei.noaa.gov (it publishes both A and AAAA records); urllib3 prefers IPv6 and
+# stalls ~10 min/request on the dead route. Forcing IPv4 → ~2s/request. Local-only:
+# the NOAA Lambda is unaffected (AWS network path works). See ncei-ipv6-findings.md.
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 
 def _parse_args(argv):
@@ -30,13 +39,17 @@ def _parse_args(argv):
         p.add_argument("--end", type=date.fromisoformat,
                        default=datetime.now(timezone.utc).date(),
                        help="inclusive end date YYYY-MM-DD (default: today UTC)")
-        # NCEI tolerates concurrent requests (verified: 2 BAs in parallel finished in
-        # ~one request's time, not 2x). extract = one wide request per BA → default 4
-        # (one thread per BA, whole backfill in ~one ~520s wave). transform is S3-only.
+        # extract = one wide request per BA (all its stations batched). With IPv4
+        # forced (see top of file) each request is ~2s; NCEI tolerates concurrency,
+        # so default 4 runs the BAs in parallel waves. transform is S3-only → 10.
         p.add_argument("--concurrency", type=int,
                        default=4 if phase == "extract" else 10,
                        help="parallel workers (extract default 4: one NCEI request "
                             "per BA, run in parallel; transform default 10: S3-only)")
+        p.add_argument("--overwrite", action="store_true",
+                       help="re-fetch/re-write keys that already exist instead of "
+                            "skipping them (default: skip for idempotent resume). Use "
+                            "when adding BAs to an already-backfilled range.")
     return parser.parse_args(argv)
 
 
@@ -49,19 +62,20 @@ def main(argv=None):
     source = os.environ.get("SOURCE", "noaa")
     logger, log_file = logconf.configure(args.phase)
     logger.info(
-        "%s start=%s end=%s concurrency=%d bucket=%s source=%s",
-        args.phase, args.start, args.end, args.concurrency, bucket, source,
+        "%s start=%s end=%s concurrency=%d bucket=%s source=%s overwrite=%s",
+        args.phase, args.start, args.end, args.concurrency, bucket, source, args.overwrite,
     )
     print(
-        f"{args.phase}: {args.start} → {args.end}  (detailed log → {log_file})",
+        f"{args.phase}: {args.start} → {args.end}"
+        f"{'  [OVERWRITE]' if args.overwrite else ''}  (detailed log → {log_file})",
         flush=True,
     )
 
     if args.phase == "extract":
         extract.run(list(client.STATIONS), args.start, args.end,
-                    bucket, source, args.concurrency, logger)
+                    bucket, source, args.concurrency, logger, args.overwrite)
     else:
-        transform.run(args.start, args.end, bucket, source, args.concurrency, logger)
+        transform.run(args.start, args.end, bucket, source, args.concurrency, logger, args.overwrite)
 
     logger.info("%s done", args.phase)
 

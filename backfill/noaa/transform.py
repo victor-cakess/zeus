@@ -50,13 +50,14 @@ def _transform_day(day, existing, bucket, source, logger) -> Counter:
     return Counter(written=1, rows=len(rows))
 
 
-def run(start: date, end: date, bucket, source, concurrency, logger):
+def run(start: date, end: date, bucket, source, concurrency, logger, overwrite=False):
     overall = Counter()
     # One bar over every day in range — the terminal "is it working" signal.
     # Per-day detail (OK/SKIP/EMPTY) goes to the log file via `logger`.
     bar = tqdm(total=(end - start).days + 1, desc="transform", unit="day")
     for year in range(start.year, end.year + 1):
-        existing = set(
+        # With --overwrite, treat no day as already-written so every parquet is rebuilt.
+        existing = set() if overwrite else set(
             s3_io.list_keys(bucket, f"curated/{source}/ingestion_year={year:04d}/")
         )
         logger.info("YEAR %s existing_parquets=%d", year, len(existing))

@@ -2,10 +2,10 @@
 split rows by day, write one raw JSON per (BA, day) — identical layout to the daily
 pipeline. The partition is backdated to each row's observation date (raw["DATE"]).
 
-NCEI's data/v1 endpoint has a ~fixed per-request latency: a 1-month, a 1-station and
-a full 16-year/10-station request all cost ~the same ~520s. So the backfill fetches
-each BA's whole range in a single request rather than per-year — 4 requests instead
-of 64, ~9x faster end to end.
+The backfill fetches each BA's whole range in a single wide request (all its stations
+batched) rather than per-year — fewer requests, simpler. With IPv4 forced in run.py
+each request is ~2s; without it a broken local IPv6 route stalls urllib3 ~10 min per
+request (see ncei-ipv6-findings.md).
 
 Idempotency: list the existing raw keys in range once, skip puts for keys already
 present. A BA that returns no rows writes nothing (re-probed cheaply on resume).
@@ -51,12 +51,15 @@ def _extract_unit(unit, start: date, end: date, existing, bucket, source, logger
     return Counter(units_with_data=1, rows=len(rows), raw_written=written, raw_skipped=skipped)
 
 
-def run(units, start: date, end: date, bucket, source, concurrency, logger):
+def run(units, start: date, end: date, bucket, source, concurrency, logger, overwrite=False):
     # Idempotency: one pass listing every existing raw key in range (union per year).
+    # With --overwrite, skip the listing entirely so every key is (re-)written.
     existing = set()
-    for year in range(start.year, end.year + 1):
-        existing |= set(s3_io.list_keys(bucket, f"raw/{source}/ingestion_year={year:04d}/"))
-    logger.info("RANGE %s..%s units=%d existing_keys=%d", start, end, len(units), len(existing))
+    if not overwrite:
+        for year in range(start.year, end.year + 1):
+            existing |= set(s3_io.list_keys(bucket, f"raw/{source}/ingestion_year={year:04d}/"))
+    logger.info("RANGE %s..%s units=%d existing_keys=%d overwrite=%s",
+                start, end, len(units), len(existing), overwrite)
 
     overall = Counter()
     # One bar over the BAs (each is a single wide request) — the "is it working"
