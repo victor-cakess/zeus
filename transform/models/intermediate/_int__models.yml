@@ -1,0 +1,67 @@
+version: 2
+
+models:
+  - name: int_eia__generation_hourly
+    description: >
+      EIA generation per (ba, period): total + renewable MWh and renewable share.
+      Hourly grain preserved (aggregate late). Renewables = SUN + WND + WAT.
+    columns:
+      - name: ba
+        description: Balancing-authority code. Join key to NOAA weather.
+        data_tests: [not_null]
+      - name: period
+        description: Hour of generation, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: total_mwh
+        description: Total generation across all fuel types for the hour (MWh).
+      - name: renewable_mwh
+        description: Solar + wind + hydro generation for the hour (MWh).
+      - name: renewable_share
+        description: renewable_mwh / total_mwh; null when total is 0.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, period]
+
+  - name: int_noaa__weather_daily
+    description: >
+      NOAA weather aggregated to (ba, observation_date) as the areal mean across the
+      BA's stations. WDF2 (wind direction) dropped — circular quantity. Datatype columns
+      keep their codes but are now BA-level station means.
+    columns:
+      - name: ba
+        description: Balancing-authority code. Join key to EIA generation.
+        data_tests: [not_null]
+      - name: observation_date
+        description: Calendar date (station local day).
+        data_tests: [not_null]
+      - name: station_count
+        description: Number of stations averaged into this BA-day (data-quality signal).
+      - name: tmax
+        description: Mean across stations of daily max temperature (°C).
+      - name: tmin
+        description: Mean across stations of daily min temperature (°C).
+      - name: tavg
+        description: Mean across stations of daily average temperature (°C).
+      - name: prcp
+        description: Mean across stations of precipitation (mm).
+      - name: snow
+        description: Mean across stations of snowfall (mm).
+      - name: snwd
+        description: Mean across stations of snow depth (mm).
+      - name: awnd
+        description: Mean across stations of average daily wind speed (m/s).
+      - name: wsf2
+        description: Mean across stations of fastest 2-minute wind speed (m/s).
+      - name: wsf5
+        description: Mean across stations of fastest 5-second wind speed (m/s).
+      - name: rhav
+        description: Mean across stations of average relative humidity (%).
+      - name: aslp
+        description: Mean across stations of average sea-level pressure (hPa).
+      - name: adpt
+        description: Mean across stations of average dew point (°C).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, observation_date]

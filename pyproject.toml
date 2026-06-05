@@ -22,3 +22,9 @@ dev = [
     "cryptography==43.0.3",
     "pyOpenSSL==24.2.1",
 ]
+
+# dbt transformation layer (transform/). Separate group — not needed by the Lambdas
+# or backfills. Install with: uv sync --group dbt
+dbt = [
+    "dbt-snowflake>=1.9,<2.0",
+]

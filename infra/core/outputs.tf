@@ -23,3 +23,12 @@ output "snowflake_account" {
 output "snowflake_database_name" {
   value = snowflake_database.zeus_dev.name
 }
+
+# dbt connects as this service user / role (key-pair auth) to build the modeled layers.
+output "snowflake_transformer_user" {
+  value = snowflake_service_user.transformer.name
+}
+
+output "snowflake_transformer_role" {
+  value = snowflake_account_role.transformer.name
+}

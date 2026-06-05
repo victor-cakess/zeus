@@ -1,0 +1,52 @@
+version: 2
+
+models:
+  - name: stg_noaa__weather
+    description: >
+      NOAA daily weather summaries, deduplicated on the lookback overlap and
+      standardized (date -> observation_date). One row per (station, observation_date),
+      tagged to a balancing authority. Wide datatype columns pass through; nulls where a
+      station did not report a datatype.
+    columns:
+      - name: observation_date
+        description: Calendar date of the weather summary (station local day).
+        data_tests: [not_null]
+      - name: station
+        description: NOAA GHCND station id.
+        data_tests: [not_null]
+      - name: ba
+        description: Balancing-authority code this station maps to. Join key to EIA grid.
+        data_tests: [not_null]
+      - name: tmax
+        description: Max temperature (°C).
+      - name: tmin
+        description: Min temperature (°C).
+      - name: tavg
+        description: Average temperature (°C).
+      - name: prcp
+        description: Precipitation (mm).
+      - name: snow
+        description: Snowfall (mm).
+      - name: snwd
+        description: Snow depth (mm).
+      - name: awnd
+        description: Average daily wind speed (m/s).
+      - name: wsf2
+        description: Fastest 2-minute wind speed (m/s).
+      - name: wsf5
+        description: Fastest 5-second wind speed (m/s).
+      - name: wdf2
+        description: Direction of fastest 2-minute wind (degrees).
+      - name: rhav
+        description: Average relative humidity (%).
+      - name: aslp
+        description: Average sea-level pressure (hPa).
+      - name: adpt
+        description: Average dew point (°C).
+      - name: ingestion_date
+        description: Date this row was ingested; used to pick the latest on dedup.
+    # Output assertion of the grain spec.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [station, observation_date]
