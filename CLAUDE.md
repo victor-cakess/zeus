@@ -233,4 +233,4 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
 
 Known issues to fix later. Not blocking; documented here so they aren't lost.
 
-- **Duplicate NOAA station ID `USW00014733` across two BAs.** In `src/lambdas/noaa/ingest/client.py`'s `STATIONS` map, the same GHCND id `USW00014733` is listed under both PJM (line 30, labeled "Baltimore" — correct; this is Baltimore-Washington Intl / BWI) and MISO (line 53, labeled "Indianapolis" — **wrong id**). So MISO silently ingests Baltimore's weather tagged as Indianapolis, and the 40-station map has only 39 unique stations. It does **not** corrupt the grain (rows are keyed `(ba, station, date)` and `ba` is tagged client-side), so MISO and PJM each get a valid row for that station — but one of MISO's 10 stations is geographically wrong. **Fix:** replace MISO's `USW00014733` with the real Indianapolis Intl id (`USW00093819`), then backfill/re-ingest MISO so the corrected station's history lands. Until then, treat MISO's "Indianapolis" weather as duplicate Baltimore data.
+_None currently._
