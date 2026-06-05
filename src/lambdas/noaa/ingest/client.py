@@ -16,47 +16,45 @@ STATIONS = {
         "USW00023174",  # Los Angeles LAX
         "USW00023188",  # San Diego
         "USW00023232",  # Sacramento
-        "USW00023257",  # Fresno
+        "USW00093193",  # Fresno
         "USW00023155",  # Bakersfield
-        "USW00023129",  # Santa Barbara
-        "USW00023185",  # San Jose
-        "USW00023272",  # Stockton
-        "USW00093193",  # Redding
+        "USW00023190",  # Santa Barbara
+        "USW00023293",  # San Jose
+        "USW00023237",  # Stockton
+        "USW00024257",  # Redding
     ],
     "PJM": [
         "USW00093738",  # Washington Dulles
-        "USW00014734",  # Philadelphia
-        "USW00014735",  # Pittsburgh
-        "USW00014733",  # Baltimore
-        "USW00014895",  # Cleveland
-        "USW00014820",  # Detroit
-        "USW00013739",  # Richmond
-        "USW00014751",  # Chicago O'Hare
-        "USW00014778",  # Columbus
-        "USW00013781",  # Roanoke
+        "USW00013739",  # Philadelphia
+        "USW00094823",  # Pittsburgh
+        "USW00093721",  # Baltimore
+        "USW00014820",  # Cleveland
+        "USW00013740",  # Richmond
+        "USW00094846",  # Chicago O'Hare
+        "USW00014821",  # Columbus
+        "USW00013741",  # Roanoke
     ],
     "ERCO": [
         "USW00003927",  # Dallas Love Field
         "USW00012960",  # Houston
         "USW00012921",  # San Antonio
         "USW00013958",  # Austin
-        "USW00012919",  # El Paso
-        "USW00003928",  # Fort Worth
+        "USW00023044",  # El Paso
+        "USW00013961",  # Fort Worth
         "USW00012924",  # Corpus Christi
-        "USW00013957",  # Lubbock
-        "USW00003900",  # Amarillo
-        "USW00012906",  # Brownsville
+        "USW00023042",  # Lubbock
+        "USW00023047",  # Amarillo
+        "USW00012919",  # Brownsville
     ],
     "MISO": [
-        "USW00094846",  # Chicago O'Hare
         "USW00014922",  # Minneapolis
-        "USW00014733",  # Indianapolis
+        "USW00093819",  # Indianapolis
         "USW00013994",  # St. Louis
-        "USW00014847",  # Detroit Metro
-        "USW00013963",  # Kansas City
-        "USW00014933",  # Milwaukee
-        "USW00013897",  # Memphis
-        "USW00014836",  # Omaha
+        "USW00094847",  # Detroit Metro
+        "USW00003947",  # Kansas City
+        "USW00014839",  # Milwaukee
+        "USW00013893",  # Memphis
+        "USW00014942",  # Omaha
         "USW00014914",  # Fargo
     ],
     "ISNE": [
@@ -85,7 +83,7 @@ STATIONS = {
         "USW00013968",  # Tulsa, OK
         "USW00003954",  # Oklahoma City Wiley Post, OK
         "USW00003928",  # Wichita, KS
-        "USW00013967",  # Olathe/Kansas City, KS
+        "USW00003967",  # Olathe/Kansas City, KS
         "USW00014939",  # Lincoln, NE
         "USW00013976",  # Lafayette, LA
     ],
@@ -121,9 +119,9 @@ STATIONS = {
         "USW00024229",  # Portland, OR
         "USW00024233",  # Seattle-Tacoma, WA
         "USW00024157",  # Spokane, WA
-        "USW00024144",  # Great Falls, MT
+        "USW00024143",  # Great Falls, MT
         "USW00024131",  # Boise, ID
-        "USW00024243",  # Wenatchee, WA
+        "USW00094239",  # Wenatchee, WA
     ],
     "PSCO": [
         "USW00003017",  # Denver, CO
