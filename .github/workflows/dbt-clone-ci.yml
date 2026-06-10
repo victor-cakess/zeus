@@ -61,7 +61,7 @@ jobs:
       - name: Create clone
         env:
           SNOWFLAKE_DATABASE: ZEUS_DEV
-        run: uv run dbt run-operation ci_clone_create --args "{suffix: $PR_NUMBER}" --profiles-dir .
+        run: 'uv run dbt run-operation ci_clone_create --args "{suffix: $PR_NUMBER}" --profiles-dir .'
 
       - name: dbt build against clone
         env:
@@ -72,4 +72,4 @@ jobs:
         if: always()
         env:
           SNOWFLAKE_DATABASE: ZEUS_DEV
-        run: uv run dbt run-operation ci_clone_drop --args "{suffix: $PR_NUMBER}" --profiles-dir .
+        run: 'uv run dbt run-operation ci_clone_drop --args "{suffix: $PR_NUMBER}" --profiles-dir .'
