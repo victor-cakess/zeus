@@ -2,7 +2,7 @@
 
 Design decisions for the Zeus data platform — an energy data ingestion and modeling system. Cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) are at the top of this document. Pipeline-specific decisions are grouped per source below.
 
-The platform runs two production ingestion pipelines — **EIA** (hourly fuel-type) and **NOAA** (daily weather summaries) — each landing data in S3 and loading it into a Snowflake landing table, plus a **digest** Lambda that emails one combined daily run-report across both. The two sources share balancing-authority codes (`ba`) so weather joins to grid data downstream.
+The platform's daily flow is one Step Functions state machine (`zeus-dev-daily-pipeline`): two production ingestion pipelines — **EIA** (hourly fuel-type) and **NOAA** (daily weather summaries) — run in parallel, each landing data in S3 and loading it into a Snowflake landing table; then a **dbt** container-image Lambda builds and tests the modeled layers; then a **digest** Lambda emails one combined run-report across both sources plus the dbt run. The digest step always runs, even when an upstream step failed. The two sources share balancing-authority codes (`ba`) so weather joins to grid data downstream.
 
 Format per entry: the decision, alternatives considered, why the chosen option won, and known trade-offs.
 
@@ -34,16 +34,18 @@ Format per entry: the decision, alternatives considered, why the chosen option w
 ```
 infra/
   core/                 # shared S3 bucket + SNS alerts topic + Snowflake warehouse/db + per-source landing stacks
-    backend.tf, ..., snowflake.tf, snowflake_eia.tf, snowflake_noaa.tf
+    backend.tf, ..., snowflake.tf, snowflake_eia.tf, snowflake_noaa.tf, snowflake_transform.tf
   modules/
-    lambda_job/         # one Lambda + IAM role + ZIP packaging
+    lambda_job/         # one zip Lambda + IAM role + ZIP packaging
     snowflake_landing/  # one source's Snowflake landing stack (decision 13)
   pipelines/
     eia/ noaa/ digest/  # one self-contained root each
+    dbt/                # ECR repo + docker build/push + container-image Lambda (DBT-1)
+    orchestration/      # the daily state machine + EventBridge cron (decision 14); applied last
       backend.tf, providers.tf, variables.tf, locals.tf
-      remote_state.tf   # consumes infra/core outputs
-      main.tf           # SSM param(s) + lambda_job + EventBridge rule + on-failure config
-      outputs.tf
+      remote_state.tf   # consumes infra/core (and, for orchestration, the other roots') outputs
+      main.tf           # SSM param(s) + the root's Lambda or state machine
+      outputs.tf        # function_arn (+ balancing_authorities for the ingests)
   build/                # gitignored Lambda zip artifacts
 ```
 
@@ -160,6 +162,8 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 - The zip is self-contained — no version skew between a layer and its consumers.
 - The ingest package is ~49 MiB zipped (dominated by `pyarrow`, plus `snowflake-connector-python` + `cryptography`), over the 50 MiB *direct-upload* limit but well under the 250 MiB unzipped limit. S3-based deploy removes the ceiling, so a future dep bump can't silently break the deploy.
 
+This decision covers the zip-shaped Lambdas (the two ingests + digest). The dbt runner, whose dependency set doesn't fit a zip, is the one container-image Lambda — see DBT-1.
+
 **Trade-offs:**
 - `null_resource` runs `uv pip install` on the operator's machine; it relies on `uv` + Python 3.12 being on PATH. If a future dep needs a different Linux ABI, we'd switch to a container or Docker build.
 - `pyarrow` + the Snowflake connector make the zip large (~49 MiB) and add ~1.2 s of cold-start init. Acceptable for a once-daily batch job.
@@ -171,27 +175,26 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 
 ---
 
-## 8. Observability: a single daily digest email + per-pipeline on-failure destinations (shared SNS topic)
+## 8. Observability: a single daily digest email + state-machine failure alerting (shared SNS topic)
 
 **Chosen:** A shared SNS topic `zeus-dev-alerts` in `infra/core/`, fed by two paths:
-1. **Combined run-report email** — each ingest Lambda only *writes* its `run_report.json` to the reports layer (succeeded/skipped, per-skip reasons, Snowflake rows loaded). A separate **digest Lambda** (`zeus-dev-reports-digest`, its own pipeline root) runs once daily after both ingest runs, reads every source's report for the day, computes each source's 30-day skip history, and publishes **one** combined email covering all sources. Adding a source = appending it to the digest's `var.sources`.
-2. **Failure alert** — each ingest Lambda's asynchronous **on-failure destination** points at the topic. EventBridge invokes asynchronously with `maximum_retry_attempts = 0`, so any unhandled crash (OOM, timeout, init error) or the total-outage `ValueError` routes the failed invocation record to the topic. The digest has its own on-failure destination too.
+1. **Combined run-report email** — each ingest Lambda only *writes* its `run_report.json` to the reports layer (succeeded/skipped, per-skip reasons, Snowflake rows loaded); the dbt runner writes its own report (models built, tests passed/failed, failed-test names). The **digest Lambda** (`zeus-dev-reports-digest`, its own pipeline root) runs as the **final state-machine step** — guaranteed to run even when an upstream step failed — reads every source's report for the day plus the dbt report, computes each source's 30-day skip history, and publishes **one** combined email. Adding a source = appending it to the digest's `var.sources`; dbt renders as its own section (it has no fan-out units).
+2. **Failure alert** — failure routing lives in the state machine (decision 14): each ingest branch catches its own failure, the dbt step's Catch routes to the digest, and a final `CheckFailures` Choice publishes the full execution state to the topic and marks the execution **Failed**. One alert point covers every crash mode (OOM, timeout, init error, total-outage `ValueError`, failing dbt tests).
 
 **Alternatives considered:**
-- **Per-pipeline run-report email** (the previous shape — each Lambda emailed its own summary). At one source it was fine; at N sources it's N emails/day. Replaced by the digest so the inbox gets exactly one summary regardless of source count. The per-pipeline Lambdas were slimmed accordingly (they no longer publish on success; they keep only the on-failure destination).
-- **CloudWatch alarm on the Lambda `Errors` metric** — also catches every crash mode, but carries no run context and needs threshold/period tuning. The on-failure destination delivers the failed event directly with zero added configuration.
+- **Per-pipeline run-report email** (each Lambda emailed its own summary). At one source it was fine; at N sources it's N emails/day. Replaced by the digest so the inbox gets exactly one summary regardless of source count.
+- **Per-Lambda async on-failure destinations + staggered EventBridge crons** (the previous shape — each Lambda had an `aws_lambda_function_event_invoke_config` routing failed async invocations to the topic). Worked, but the failure surface was scattered across N resources, the alert was the raw async-destination envelope, dbt wasn't part of the flow at all, and nothing guaranteed the digest ran after a crash. Superseded by the state machine's single catch-and-alert path.
+- **CloudWatch alarm on the Lambda `Errors` metric** — also catches every crash mode, but carries no run context and needs threshold/period tuning.
 - **Per-pipeline SNS topic** — an extra subscription/confirmation per pipeline. The shared topic routes everything to one inbox.
-- **Chaining the digest off the ingest Lambdas** (invoke it when the last source finishes) — couples the pipelines and needs completion signalling. A standalone scheduled digest that reads whatever reports exist is decoupled and tolerates a missing report (surfaced as "no report", since that source's own on-failure alert already fired).
 
 **Why:**
-- One email/day across all sources is the operational signal that scales — the digest reuses `src/shared/report.py` and reads the persisted `run_report.json` files, so it needs no coordination with the ingest runs.
-- The on-failure destination is the per-pipeline safety net for crashes that happen *before* the report is written. It's a single `aws_lambda_function_event_invoke_config` resource per pipeline.
-- The shared topic means each pipeline only needs `sns:Publish` permission (for its destination) and the digest needs `s3:GetObject`/`ListBucket` on `reports/*` — no changes to `infra/core/`.
+- One email/day across all sources is the operational signal that scales — the digest reuses `src/shared/report.py` and reads the persisted `run_report.json` files, so it needs no coordination with the ingest runs beyond its position in the DAG.
+- The state machine gives the failure semantics in one place: digest always runs, any failure → one SNS alert + a red execution in the console/CloudWatch metrics.
+- The shared topic means the state machine needs one `sns:Publish` permission and the digest needs `s3:GetObject`/`ListBucket` on `reports/*` — no changes to `infra/core/`.
 
 **Trade-offs:**
-- The digest fires on a schedule (08:00 UTC) rather than on completion, so it assumes both ingest runs (07:00 / 07:30 UTC) have finished — fine with the staggered crons, and a not-yet-written report just shows as "no report".
-- The on-failure alert is the raw Lambda async-destination envelope (JSON), not hand-formatted. The readable summary comes from the digest; the envelope is the fallback for hard crashes.
-- `maximum_retry_attempts = 0` means a transient platform error fails the run rather than auto-retrying. The daily schedule and the rolling lookback make the next run self-healing, and per-unit HTTP errors are already retried inside the Lambda.
+- The failure alert is `States.JsonToString($)` of the execution state — complete but raw JSON. The readable summary comes from the digest email, which carries the per-source and dbt detail (reports are written *before* a step raises, exactly so the digest can render them on failure days).
+- Retries on each `lambda:invoke` cover only AWS-transient errors (2 attempts); a function error fails the step immediately. The daily schedule and the rolling lookback make the next run self-healing, and per-unit HTTP errors are already retried inside the Lambda.
 
 ---
 
@@ -210,7 +213,7 @@ s3://zeus-dev-energy-data/reports/<source>/ingestion_year=YYYY/ingestion_month=M
 
 ## 10. Terraform module: a single reusable `lambda_job`
 
-**Chosen:** A shared module, `infra/modules/lambda_job/`. It packages a single Lambda: `null_resource` build (`uv pip install` + copy handler files + copy `src/shared/`) → `archive_file` → IAM role (basic execution + a caller-supplied inline policy) → `aws_lambda_function`. Source/build dirs, env vars, memory/timeout, and policy statements are inputs. The pipeline root composes everything else (SSM parameter, EventBridge rule, lambda permission, on-failure invoke config) directly. (A second shared module, `snowflake_landing`, was later added for the per-source Snowflake DDL — see decision 13.)
+**Chosen:** A shared module, `infra/modules/lambda_job/`. It packages a single **zip** Lambda: `null_resource` build (`uv pip install` + copy handler files + copy `src/shared/`) → `archive_file` → IAM role (basic execution + a caller-supplied inline policy) → `aws_lambda_function`. Source/build dirs, env vars, memory/timeout, and policy statements are inputs. The pipeline root composes everything else (SSM parameters) directly; scheduling and failure routing are owned by the orchestration root (decision 14). The module is zip-only by design — the dbt runner's container-image Lambda is authored inline in its own root (DBT-1). (A second shared module, `snowflake_landing`, was later added for the per-source Snowflake DDL — see decision 13.)
 
 **Alternatives considered:**
 - **A `pipeline` composition module** that wired two `lambda_job` instances, a Step Functions state machine, EventBridge, SSM, and the alert rule. This was the previous shape; it was removed because it hard-coded a two-Lambda fan-out → consolidate orchestration that the pipeline no longer uses (see EIA-1). Collapsing to one Lambda made the composition module more indirection than it removed.
@@ -297,6 +300,30 @@ rows = [normalize_row(r, today)
 
 ---
 
+## 14. Daily orchestration: one Step Functions state machine over the pipeline Lambdas
+
+**Chosen:** A `STANDARD` state machine `zeus-dev-daily-pipeline` (root `infra/pipelines/orchestration/`) runs the whole daily flow: `Ingest` (Parallel — one branch per source, each a single `lambda:invoke` with that source's full BA list) → `Dbt` → `Digest` → `CheckFailures`. Each ingest branch **catches its own failure** and normalizes to `{source, failed}` Pass states so the Parallel always completes; the Dbt step's Catch routes straight to the digest — **the digest always runs**. `CheckFailures` inspects `$.ingest[i].failed` / `$.dbtError` / `$.digestError`; on any failure it publishes the execution state to `zeus-dev-alerts` and ends the execution **Failed**. One EventBridge cron (`cron(0 7 * * ? *)`) starts the execution with input `{}`; payloads are baked into the definition from the pipeline roots' outputs (`balancing_authorities`, function ARNs) via remote state. CloudWatch logging `level = ALL` + execution data, X-Ray tracing on. Retries on each `lambda:invoke` cover only the AWS-transient errors (2 attempts, backoff 2.0) — a function error goes straight to the Catch, since retrying a code bug just doubles the run.
+
+**Alternatives considered:**
+- **Per-Lambda staggered EventBridge crons + async on-failure destinations** (the previous shape: EIA 07:00, NOAA 07:30, digest 08:00, each with its own rule, `aws_lambda_permission`, and `aws_lambda_function_event_invoke_config`). Worked for independent ingests, but had no chaining (dbt was run manually), the digest relied on a timing assumption rather than sequencing, failure handling was scattered across N resources, and there was no end-to-end execution view.
+- **Step Functions with a per-BA `Map` fan-out** (71 branches). Nice console visibility, but overengineering at this workload: worst observed daily EIA run is 59 s against a 300 s Lambda timeout, so there is no runtime pressure to escape; 71 concurrent invocations hammer the EIA API harder than the in-Lambda thread pool capped at 20; and the per-BA detail it would visualize already exists in the run reports + digest email. Fan-out stays in-process (EIA-1); SFN orchestrates at the source level only.
+- **Chaining Lambdas directly** (each invokes the next, or S3-event triggers). No retry/catch semantics, no execution graph, failure handling re-implemented in every handler.
+- **Airflow / MWAA** — an order of magnitude more infrastructure and cost for a 4-step daily DAG.
+
+**Why:**
+- The user-facing requirements were: the digest must ALWAYS run, full end-to-end visibility, and preserved per-source failure detail. The Parallel-with-branch-Catch + final Choice shape delivers all three declaratively.
+- dbt joins the daily flow as a first-class step (it was previously manual), with its failure surfaced the same way as an ingest failure.
+- A bad day is **red** — in the SFN console, in CloudWatch metrics, and in the inbox — from a single alert point.
+- BA lists and function ARNs are consumed from each pipeline root's outputs, so the orchestration root duplicates nothing.
+
+**Trade-offs:**
+- One more Terraform root, two more IAM roles (SFN execution + EventBridge trigger), and an apply-order constraint: the orchestration root must be applied **after** the roots whose outputs it consumes.
+- The `CheckFailures` rules reference `$.ingest[0]` / `$.ingest[1]` positionally — branch order in the definition is load-bearing (noted in `main.tf`).
+- The failure alert is raw execution-state JSON; the human-readable detail intentionally lives in the digest email (decision 8).
+- Observed: a full execution (parallel ingest → dbt → digest) completes in ~30 s.
+
+---
+
 # Pipeline-specific decisions
 
 ## EIA pipeline
@@ -305,21 +332,21 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 
 ### EIA-1. Orchestration: a single Lambda with an in-process thread fan-out
 
-**Chosen:** One Lambda, `zeus-dev-eia-ingest`, invoked directly by EventBridge. It fans out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS` env var, default 20), writes one raw JSON file per BA, then — in the same invocation — reads back the day's raw partition and consolidates it into a single curated Parquet and writes a run report. It does **not** email — the daily digest Lambda (decision 8) sends the combined summary.
+**Chosen:** One Lambda, `zeus-dev-eia-ingest`, invoked synchronously by the daily state machine (decision 14). It fans out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS` env var, default 20), writes one raw JSON file per BA, then — in the same invocation — reads back the day's raw partition and consolidates it into a single curated Parquet and writes a run report. It does **not** email — the daily digest Lambda (decision 8) sends the combined summary.
 
 **Alternatives considered:**
-- **Step Functions `Map` fan-out + a separate consolidation Lambda.** This was the previous architecture: a `STANDARD` workflow with a `Map` state (one extract Lambda per BA) feeding a `Consolidate` task. Replaced because the orchestration outweighed the workload — the full run takes ~12.5 s, comfortably inside a single Lambda's limits, and a state machine plus a second Lambda plus their IAM roles and the failure-alert rule were more moving parts than the job warranted.
+- **Step Functions `Map` fan-out + a separate consolidation Lambda.** This was the previous architecture: a `STANDARD` workflow with a `Map` state (one extract Lambda per BA) feeding a `Consolidate` task. Replaced because the orchestration outweighed the workload — daily runs complete in 18–59 s, comfortably inside a single Lambda's limits, and a per-BA state machine plus a second Lambda plus their IAM roles were more moving parts than the job warranted. (Step Functions later returned at the *source* level — one branch per pipeline, decision 14 — which is a different altitude: the per-BA fan-out stays in-process.)
 - **A sequential `for` loop over BAs.** Simplest, but ~71 paginated HTTP fetches in series would stretch the run substantially. The thread pool keeps it parallel without an orchestrator.
 
 **Why a single threaded Lambda won:**
-- 71 BAs complete in ~12.5 s — far inside the 300 s timeout, even with the consolidation pass.
+- 71 BAs complete in 18–59 s in production (avg ~40 s; ~12.5 s warm) — far inside the 300 s timeout, even with the consolidation pass.
 - `ThreadPoolExecutor` gives the parallelism the `Map` state used to provide (the work is I/O-bound HTTP, which threads handle well).
 - Per-BA failure is handled in-process: each worker catches its own errors and returns a `skipped` result; the run continues. No orchestrator needed for fault isolation.
 - Far less infrastructure: no state machine, no second Lambda, no extra IAM role, no execution-status alert rule.
 
 **Trade-offs:**
-- No Step Functions execution graph in the console. Per-run visibility is the daily digest email plus CloudWatch logs/metrics; per-BA forensics means reading logs rather than clicking a branch.
-- Retry is whole-run, not per-BA. At ~12.5 s a full re-run is cheap, and per-BA HTTP errors are already retried inside the client.
+- The state machine's execution graph shows the EIA step, not per-BA branches. Per-BA visibility is the run report + digest email (succeeded/skipped with reasons) plus CloudWatch logs; per-BA forensics means reading logs rather than clicking a branch.
+- Retry is whole-run, not per-BA. At under a minute a full re-run is cheap, and per-BA HTTP errors are already retried inside the client.
 
 ---
 
@@ -329,12 +356,12 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 
 **Why these numbers:**
 - Memory 1024 MB: the single Lambda holds up to `MAX_WORKERS` BAs' row-sets in flight during the fan-out *and* builds the full-day pyarrow table during consolidation. Observed peak is ~247 MB, so 1024 MB leaves comfortable headroom; Lambda CPU also scales with memory, which helps the pyarrow write.
-- Timeout 300 s: observed full run is ~12.5 s. The 5-minute ceiling is headroom against a slow EIA API.
+- Timeout 300 s: observed daily runs are 18–59 s. The 5-minute ceiling is headroom against a slow EIA API.
 - Python 3.12 matches the project's `.python-version`.
 
-**Performance:**
+**Performance (observed in production, CloudWatch `Duration`, June 2026):**
 - Cold-start init ~1.2 s (ZIP + `pyarrow`).
-- Full 71-BA run ~12.5 s, peak memory ~247 MB.
+- Daily 71-BA runs 18–59 s, avg ~40 s (cold start + EIA API latency variance; a warm run is ~12.5 s). Peak memory ~247 MB.
 
 ---
 
@@ -353,9 +380,9 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 
 ---
 
-### EIA-4. EventBridge schedule: `cron(0 7 * * ? *)` (07:00 UTC daily)
+### EIA-4. Daily schedule: 07:00 UTC (owned by the orchestration trigger)
 
-**Chosen:** 07:00 UTC = 04:00 in `sa-east-1` (São Paulo).
+**Chosen:** The daily state machine's EventBridge rule fires `cron(0 7 * * ? *)` (07:00 UTC = 04:00 in `sa-east-1`); EIA runs as a parallel branch of that execution. The EIA root owns no schedule of its own.
 
 **Why:**
 - EIA typically publishes the previous day's data + revisions by 06:00 UTC.
@@ -426,7 +453,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 **Why:**
 - Reading the raw partition back (rather than consolidating in-memory from the fetch results) means the consolidation reflects exactly what landed in S3 — partial fan-outs consolidate cleanly.
 - Keeping raw and curated separate preserves raw as the immutable source of truth; re-running never modifies raw files.
-- The total-outage guard (`ValueError` when zero rows consolidated) turns a silent empty day into a hard failure that reaches the on-failure destination.
+- The total-outage guard (`ValueError` when zero rows consolidated) turns a silent empty day into a hard failure that the state machine's branch Catch surfaces (SNS alert + Failed execution, decision 14).
 
 **Trade-offs:**
 - Consolidation reads the whole day's prefix, so a same-day re-run includes any earlier writes for that day and overwrites the curated Parquet. This is idempotent by key and matches the append-only/overwrite-by-key contract.
@@ -448,7 +475,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 - Shortest path that lands rows in the same invocation, with no new AWS runtime infrastructure — just the storage integration, an IAM role, and an SSM secret.
 - `FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE)` is **required**: without it Snowflake reads the Parquet `period` as a raw INT64 and the timestamp loads as "Invalid date".
 - Snowflake's per-file load metadata makes a same-day re-run idempotent (the already-loaded Parquet is skipped); cross-day overlap is the intended duplication, resolved downstream.
-- A load failure is recorded in the run report, then re-raised so the async on-failure destination alerts (decision 8) — the curated Parquet stays safe in S3 and the load is re-runnable.
+- A load failure is recorded in the run report, then re-raised so the state machine's branch Catch alerts (decisions 8, 14) — the curated Parquet stays safe in S3 and the load is re-runnable.
 
 **Trade-offs:**
 - The append-only landing table carries ~7× row duplication from the lookback overlap; the deduped view is dbt's job (not yet built).
@@ -462,7 +489,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 
 | Metric | Value |
 |---|---|
-| Full run (71 BAs) | **~12.5 seconds** |
+| Full run (71 BAs), daily production | **18–59 s, avg ~40 s** (~12.5 s warm; CloudWatch `Duration`, June 2026) |
 | Lambda invocations per run | 1 (internal fan-out across 20 threads) |
 | Peak memory used | ~247 MB (of 1024 MB) |
 | Cold-start init | ~1.2 s |
@@ -473,7 +500,7 @@ Pulls hourly fuel-type data from EIA Form-930 for 71 balancing authorities, dail
 - Per-BA error or 0-row response → recorded as `skipped`, run continues.
 - API-level retry inside the client on HTTP 502/503/504 with backoff (10 s, 20 s, 30 s).
 - Late-arriving EIA corrections caught by the 7-day rolling lookback.
-- Total outage (0 rows consolidated) → `ValueError` → failed async invocation → on-failure destination → SNS alert.
+- Total outage (0 rows consolidated) → `ValueError` → caught by the EIA branch (decision 14) → digest still runs and shows "no report" → SNS alert + execution Failed.
 - `run_report.json` written on every completed run; the daily digest (decision 8) turns it into a combined email.
 - Source-of-truth integrity preserved via append-only S3 partitions; downstream de-dup is non-destructive.
 
@@ -515,7 +542,7 @@ Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-
 
 **Chosen:** Each run pulls the last 7 days (`lookback_window_dates`) into today's partition; append-only, deduped downstream on `(date, station)` keeping the latest `ingestion_date`.
 
-**Why:** NCEI daily-summaries are **provisional and lag** — recent days arrive late (the smoke test's 7-day window only had data through 3 days prior) and get QC-revised. The overlap catches both, exactly as EIA's lookback catches EIA's corrections. Schedule is `cron(30 7 * * ? *)`, staggered 30 min after EIA so the two daily runs don't overlap.
+**Why:** NCEI daily-summaries are **provisional and lag** — recent days arrive late (the smoke test's 7-day window only had data through 3 days prior) and get QC-revised. The overlap catches both, exactly as EIA's lookback catches EIA's corrections. NOAA runs in parallel with EIA at 07:00 UTC as a branch of the daily state machine (decision 14) — nothing the two pipelines touch contends (different APIs, S3 prefixes, Snowflake tables/users). Observed daily runs: 5–50 s, avg ~13.5 s.
 
 ### NOAA-5. Historical backfill: two-phase, day-partitioned; force IPv4 from local dev
 
@@ -538,3 +565,49 @@ Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-
 **Why overwrite won:** simplest to run with the existing tooling; the landing table is append-only and deduped downstream on `(date, station)`, so re-loading the original 4 BAs as duplicates is tolerated and cleaned in the (future) dbt layer.
 
 **Trade-offs:** the whole-stage re-`COPY` reloads every curated file (new etags), duplicating the original 4 BAs' full history in `NOAA_GRID` until the downstream dedup runs — a deliberate, one-time exception to the backfill's usual "run once" rule.
+
+---
+
+## dbt pipeline
+
+Runs `dbt build` (staging + intermediate models and their tests) over `transform/` against `ZEUS_DEV`, daily, as the `Dbt` step of the state machine (decision 14) — between the ingest Parallel and the digest.
+
+### DBT-1. Runner: a container-image Lambda
+
+**Chosen:** One Lambda, `zeus-dev-dbt-run` (2048 MB / 300 s), deployed as a **container image**: `FROM public.ecr.aws/lambda/python:3.12`, `pip install dbt-snowflake`, `COPY transform/` + `src/shared/` + the handler, and `dbt deps` baked at build time so the runtime never hits the package hub. The image lives in an ECR repo (`zeus-dev-dbt-run`, lifecycle policy keeps the last 3 images), tagged with a content hash over the Dockerfile/handler/`transform/`/`src/shared/` so any change forces a rebuild + push (the same fingerprint pattern as `lambda_job`'s zip builds; the docker build context is the repo root, allowlisted by `.dockerignore`). The Lambda resource is authored inline in `infra/pipelines/dbt/` — `lambda_job` stays zip-only (decision 10). The handler invokes dbt in-process via `dbtRunner` and authenticates as `ZEUS_DEV_TRANSFORMER` (key-pair; private key in SSM `/zeus/dev/snowflake/transformer_private_key`, fetched to `/tmp` per run — same secret contract as decisions 5–6).
+
+**Alternatives considered:**
+- **Zip Lambda (decision 7's pattern).** `dbt-snowflake` + its dependency tree plus the dbt project files don't fit the zip limits comfortably, and dbt expects a real filesystem project layout — the image COPYs `transform/` in as-is.
+- **Fargate task.** The standard "dbt in production" answer at scale, but it brings a cluster, task definitions, and networking for a job that completes in ~23 s once a day. A container Lambda is the same image with none of that.
+- **dbt Cloud** — managed scheduler/runner; a paid service and a second orchestrator when the state machine already owns the DAG.
+
+**Why:**
+- The whole daily build is ~23 s (4 models, 14 tests) — squarely a Lambda-sized job; the 300 s timeout and 2048 MB leave generous headroom (observed peak ~273 MB).
+- The state machine needs one more `lambda:invoke` step — dbt gets the exact same retry/catch/alert semantics as the ingests.
+- Image cold-start (~3.8 s init) is irrelevant for a daily batch.
+
+**Trade-offs:**
+- Applies of the dbt root need `docker` + `aws` on PATH (ECR login + build + push), in addition to the zip builds' `uv`/`python3.12`.
+- Model/test changes in `transform/` mean an image rebuild + push (~seconds with a warm layer cache), not just a zip re-upload.
+
+### DBT-2. Report-before-raise: the dbt run report feeds the digest
+
+**Chosen:** The handler summarizes the `dbtRunner` result (models built, tests passed/failed, failed-test **names**) and writes `reports/dbt/.../run_report.json` — same reports-layer layout as the ingests, with `source = dbt` — **before** raising on failure. The digest reads it alongside the source reports and renders dbt as its own section (subject chip `dbt 4 models / 14 tests` or `dbt FAILED 2 tests`; body lists the failed tests). `SOURCES` stays `eia,noaa` — dbt has no fan-out units, so it is not a source section.
+
+**Why:**
+- A failing dbt test day produces a digest email that says **which** tests failed, plus the execution-level SNS alert (decision 8). Writing the report before raising is what guarantees the digest has the detail even on failure days; "dbt: no report" then only means dbt crashed before finishing.
+- `dbt build` (rather than `run` + `test`) treats test failures as a failed run, so data-quality regressions fail the pipeline step — visible as a red execution, not a silent pass.
+
+**Trade-offs:**
+- The report write needs its own scoped IAM (`s3:PutObject` on `reports/dbt/*`) on the dbt role.
+
+### DBT-3. Lambda-runtime detour worth recording: no `/dev/shm`
+
+**Chosen / the lesson:** AWS Lambda's sandbox has **no `/dev/shm`**, so constructing any `multiprocessing` semaphore (`SemLock`) raises `FileNotFoundError` — and dbt touches them in two places even though its parallelism is threads-only. The handler applies two patches **before importing `dbt.cli`** (order matters: dbt's `Manifest` dataclass binds `get_mp_context().Lock` at class-definition time):
+1. `dbt.mp_context._MP_CONTEXT = multiprocessing.dummy` — the threading-backed drop-in for the locks dbt itself creates.
+2. The default context's `SimpleQueue` → an `os.pipe()`-backed shim — stdlib `ThreadPool`'s internal change-notifier queue is SemLock-backed even though all its work queues are plain thread queues (pipes need no semaphores).
+
+The fix was verified **locally** by stubbing `_multiprocessing.SemLock` to raise inside the container and running the real handler against Snowflake — green locally meant green on Lambda first try. That stub-the-runtime-limitation harness is the fast way to debug dbt-in-Lambda issues without deploy cycles.
+
+**Trade-offs:**
+- Both patches reach into stdlib/dbt private internals and are the most upgrade-fragile code in the repo; they live in the handler with full rationale in comments, pinned to the dbt 1.11 / Python 3.12 pair in the image.

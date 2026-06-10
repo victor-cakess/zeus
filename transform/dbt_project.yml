@@ -1,0 +1,28 @@
+name: "zeus"
+version: "1.0.0"
+config-version: 2
+
+# Connection profile lives in this project (profiles.yml here), driven by SNOWFLAKE_*
+# env vars — the same convention the backfill scripts use. Run dbt from transform/.
+profile: "zeus"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  zeus:
+    # staging: light, 1:1 with landing — dedup the lookback overlap + standardize names.
+    # Views (cheap, always fresh); each layer lands in its own schema (see generate_schema_name).
+    staging:
+      +materialized: view
+      +schema: staging
+    # intermediate: reshape + per-source business logic (fuel pivot, station rollup).
+    # Views so each step stays queryable for inspection. Feeds the cross-source marts.
+    intermediate:
+      +materialized: view
+      +schema: intermediate

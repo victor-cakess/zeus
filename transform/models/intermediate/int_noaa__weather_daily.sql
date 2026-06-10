@@ -1,0 +1,35 @@
+-- NOAA weather aggregated from station grain to one row per (ba, observation_date) —
+-- the grain that joins to EIA generation.
+--
+-- Aggregation rule: areal MEAN across the BA's stations for every datatype (avg, not
+-- sum — each value is a single station's reading, so the BA-representative value is the
+-- average, including for precipitation and snow). WDF2 (wind *direction*, degrees) is
+-- deliberately dropped: direction is a circular quantity, so a plain average is wrong
+-- (avg of 350 and 10 is 180, the opposite of the true ~0). station_count exposes how
+-- many stations backed each BA-day — a data-quality signal for downstream.
+with weather as (
+    select * from {{ ref('stg_noaa__weather') }}
+),
+
+aggregated as (
+    select
+        ba,
+        observation_date,
+        count(distinct station) as station_count,
+        avg(tmax) as tmax,
+        avg(tmin) as tmin,
+        avg(tavg) as tavg,
+        avg(prcp) as prcp,
+        avg(snow) as snow,
+        avg(snwd) as snwd,
+        avg(awnd) as awnd,
+        avg(wsf2) as wsf2,
+        avg(wsf5) as wsf5,
+        avg(rhav) as rhav,
+        avg(aslp) as aslp,
+        avg(adpt) as adpt
+    from weather
+    group by ba, observation_date
+)
+
+select * from aggregated

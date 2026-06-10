@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: eia
+    database: "{{ target.database }}"
+    schema: EIA
+    description: EIA hourly grid-mix landing, loaded by the zeus-dev-eia-ingest Lambda's COPY INTO.
+    tables:
+      - name: eia_grid
+        description: >
+          Append-only EIA landing table. One row per (respondent, period, fueltype).
+          Duplicates from the rolling 7-day lookback overlap are removed in
+          stg_eia__generation (keep latest ingestion_date).

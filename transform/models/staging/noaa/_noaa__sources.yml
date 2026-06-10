@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: noaa
+    database: "{{ target.database }}"
+    schema: NOAA
+    description: NOAA daily weather-summary landing, loaded by the zeus-dev-noaa-ingest Lambda's COPY INTO.
+    tables:
+      - name: noaa_grid
+        description: >
+          Append-only NOAA landing table. Wide: one row per (ba, station, date) with 13
+          datatype columns (absent datatypes land null). Duplicates from the rolling
+          lookback overlap are removed in stg_noaa__weather (keep latest ingestion_date).

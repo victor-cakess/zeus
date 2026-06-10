@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: stg_eia__generation
+    description: >
+      EIA hourly generation by fuel type, deduplicated on the lookback overlap and
+      standardized (respondent -> ba, value -> generation_mwh). Kept at native hourly
+      grain so the duck-curve / intraday detail survives for downstream models.
+    columns:
+      - name: period
+        description: Hour of generation, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: ba
+        description: Balancing-authority code (EIA respondent). Join key to NOAA weather.
+        data_tests: [not_null]
+      - name: ba_name
+        description: Human-readable balancing-authority name.
+      - name: fuel_type
+        description: EIA fuel-type code (e.g. SUN, WND, NG, COL).
+        data_tests: [not_null]
+      - name: fuel_type_name
+        description: Human-readable fuel-type label.
+      - name: generation_mwh
+        description: Generation for the hour/fuel, in megawatthours.
+      - name: value_units
+        description: Source units string (constant "megawatthours").
+      - name: ingestion_date
+        description: Date this row was ingested; used to pick the latest on dedup.
+    # Output assertion of the grain spec.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, period, fuel_type]

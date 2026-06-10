@@ -66,14 +66,47 @@ def format_email(
     return subject, "\n".join(lines)
 
 
+def format_dbt_section(dbt_report: dict | None) -> tuple[str, str]:
+    """Subject chip + body block for the daily dbt run. dbt isn't a fan-out source
+    (no succeeded/skipped units), so it gets its own section, not a source section.
+    A None report means dbt crashed before writing one (see failure alert)."""
+    if dbt_report is None:
+        return "dbt no report", "DBT: no run report (it crashed before writing one — see failure alert)."
+
+    if dbt_report["status"] == "ok":
+        chip = f"dbt {dbt_report['models_built']} models / {dbt_report['tests_passed']} tests"
+    elif dbt_report["tests_failed"]:
+        chip = f"dbt FAILED {dbt_report['tests_failed']} tests"
+    else:
+        chip = "dbt FAILED"
+
+    lines = [
+        f"DBT build — {dbt_report['date']}",
+        f"Models built: {dbt_report['models_built']}"
+        f" | Tests passed: {dbt_report['tests_passed']}"
+        f" | Tests failed: {dbt_report['tests_failed']}",
+    ]
+    if dbt_report["failed_tests"]:
+        lines.append("")
+        lines.append("Failed tests:")
+        for name in dbt_report["failed_tests"]:
+            lines.append(f"  {name}")
+    if dbt_report.get("error"):
+        lines.append("")
+        lines.append(f"Error: {dbt_report['error']}")
+
+    return chip, "\n".join(lines)
+
+
 def format_digest(
-    date_str: str, sections: list[tuple], history_days: int
+    date_str: str, sections: list[tuple], history_days: int, dbt_report: dict | None = None
 ) -> tuple[str, str]:
     """Combine one day's per-source run into a single email.
 
     `sections` is a list of (source, run_report | None, history) — one per source.
     A None run_report means that pipeline wrote no report today (it crashed and its
     own on-failure alert already fired); it's surfaced here, not hidden.
+    `dbt_report` is the dbt run's report, rendered as its own section.
     """
     summary = []
     bodies = []
@@ -88,6 +121,10 @@ def format_digest(
         summary.append(f"{label} {n_ok} ok / {n_skip} skipped")
         _, body = format_email(run_report, history, source, history_days)
         bodies.append(body)
+
+    dbt_chip, dbt_body = format_dbt_section(dbt_report)
+    summary.append(dbt_chip)
+    bodies.append(dbt_body)
 
     subject = f"Zeus daily {date_str} — " + " | ".join(summary)
     return subject, "\n\n".join(bodies)
