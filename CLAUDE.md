@@ -9,6 +9,7 @@ Python 3.12+ project managed with `uv`. The repo is a data platform for energy d
 ## Repository layout
 
 ```
+.github/workflows/ci.yml          # PR/push offline gates: gitleaks + dbt parse + terraform fmt/validate (see Working norms → CI)
 infra/
   core/                           # Terraform root: shared S3 bucket + SNS alerts topic + Snowflake warehouse/db + per-source Snowflake DDL
     backend.tf, providers.tf, variables.tf, locals.tf, main.tf, sns.tf, outputs.tf
@@ -41,6 +42,7 @@ src/
     digest/                       # digest Lambda: handler.py reads each source's run_report.json + the dbt report, sends one combined email (requirements.txt: boto3 only)
     dbt/                          # dbt runner Lambda (container image): Dockerfile (bakes transform/ + dbt deps) + handler.py (thin: key → patches → dbt build → report) + lambda_mp_patch.py (/dev/shm patches) + requirements.txt
 transform/                        # dbt project (staging + intermediate models + tests; profiles.yml env-var driven, key-pair auth) — COPYed into the dbt image at build
+  DECISIONS.md                    # modeling/business-rule decision records (M-N entries; infra ADRs stay in README.md)
 extraction/                       # gitignored, exploratory notebooks
 backfill/                         # one-off historical backfill scripts (reuse src/ via _bootstrap.py); see backfill/README.md
   eia/                            # fetch→raw→curated→COPY: run.py (extract/transform) + fetch.py + extract.py + transform.py + snowflake_load.py + units.py (BA list) + _bootstrap.py + logconf.py
@@ -237,7 +239,7 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
 
 ## Decisions reference
 
-`README.md` records the architectural decisions for the platform — cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) at the top, EIA-specific decisions in their own section. Read it before proposing structural changes.
+`README.md` records the architectural decisions for the platform — cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) at the top, pipeline-specific decisions in their own sections. Modeling and business-rule decisions for the dbt layer (grain, metric definitions, join semantics) live in `transform/DECISIONS.md` (`M-N` entries, same format); the enforceable contract (tests, column docs) stays in each layer's `schema.yml`. Read the relevant file before proposing structural or modeling changes.
 
 ## Working norms
 
@@ -254,7 +256,10 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
 - Event payload contract: the state machine invokes each ingest Lambda with `{"units": [...]}` (baked into the ASL from the pipeline roots' `balancing_authorities` outputs); the handler reads `event["units"]`. The same contract works for any fan-out source. The dbt and digest steps take `{}`.
 - Shared AWS clients (`src/shared/{s3_io,ssm,sns,snowflake_io}.py`) are module-level singletons by convention; tests substitute them by monkeypatching module attributes (see the dbt container test harness). Keep new shared helpers consistent.
 
-### Build troubleshooting
+### CI (GitHub Actions)
+- **Phase 1 (live):** `.github/workflows/ci.yml` runs the offline gates on every PR and push to main — pre-commit (gitleaks), `dbt parse` (dummy creds; parse doesn't connect), and per-root `terraform fmt -check` + `validate` (`init -backend=false` — no state, no cloud creds). It automates the cheap end of "Done means"; the warehouse- and AWS-touching tiers stay local for now.
+- **Phase 2 (planned — dbt clone CI):** on PR, `CREATE DATABASE ZEUS_CI_PR_<n> CLONE ZEUS_DEV` (zero-copy, instant) → `dbt build` against the clone (`SNOWFLAKE_DATABASE` env var — profiles.yml is already env-var driven, zero code change) → drop the clone. Prereqs: a least-privilege CI Snowflake service user + role (same key-pair pattern as the loaders, provisioned in `infra/core`), private key in GitHub Actions secrets. Upgrade path: Slim CI (`state:modified+`) once a production manifest is stored. **Trigger to build it:** the marts layer landing (incremental tables make clone isolation actually matter; views barely need it).
+- **Phase 3 (deferred — Terraform plan on PRs):** blocked on migrating Terraform state from local to an S3 backend (+ DynamoDB locking) and AWS OIDC for the runner; the `local-exec` builds also need docker/uv/python3.12 on the runner. Do the backend migration as its own project first; don't bolt it onto CI.
 - **`/bin/sh: uv: not found` during `terraform apply`.** The Lambda build is a `local-exec` provisioner (`infra/modules/lambda_job/main.tf`) that Terraform runs under **`/bin/sh`** — a non-interactive, non-login shell that does **not** source your shell config. If `uv` is a shim/alias/shell function, or lives only on your interactive shell's PATH (common with version managers or a venv that doesn't ship `uv`), the build fails with `/bin/sh: uv: not found` **even though `uv` works fine in your terminal**. The fix is to put a **real `uv` binary** on a directory that's already on PATH for non-interactive shells — `~/.local/bin` works:
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh   # installs uv + uvx to ~/.local/bin
@@ -271,10 +276,14 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
 - Append-only, immutable. Downstream de-dup at query time, not write time.
 
 ### Done means
+
+Verification is proportional to the **blast radius of the change** — match the test to what the change can actually break, not to the size of the pipeline.
+
 - Terraform `validate` passes and `plan` is clean.
-- For Lambda changes: smoke-test one invocation end-to-end (Lambda → S3 → Snowflake) before declaring done.
-- For pipeline changes: invoke the Lambda once with the full units list and confirm all expected raw + curated partitions land.
-- For orchestration or dbt changes: one `aws stepfunctions start-execution` end-to-end — all states green, the digest email arrives (with the dbt section), and a deliberately failed step still runs the digest + fires the SNS alert + marks the execution Failed.
+- **dbt models/tests only (`transform/`):** local `dbt build` green (models + tests) + a spot-check query of the changed columns + `terraform apply` the dbt root + one `aws lambda invoke zeus-dev-dbt-run` to validate the deployed image (~23 s, dbt only). **No state-machine run, no re-ingestion** — a model change can't break ingestion or wiring, and a full DAG run can fail for reasons unrelated to the change. The apply is NOT optional: the dbt project is **baked into the image**, so a local-only build is silently reverted by the next cron.
+- **dbt runner changes (handler / Dockerfile / deps / mp patches):** local container gate (run the handler in the image with `_multiprocessing.SemLock` stubbed to raise) + apply + one dbt Lambda invoke.
+- **Ingestion Lambda changes:** smoke-test one invocation end-to-end (Lambda → S3 → Snowflake) before declaring done; for pipeline changes, invoke once with the full units list and confirm all expected raw + curated partitions land.
+- **Orchestration changes:** one `aws stepfunctions start-execution` end-to-end — the wiring itself is under test: all states green, the digest email arrives (with the dbt section), and a deliberately failed step still runs the digest + fires the SNS alert + marks the execution Failed.
 - For Snowflake-touching changes: confirm rows land in the source's landing table (`ZEUS_DEV.EIA.EIA_GRID` / `ZEUS_DEV.NOAA.NOAA_GRID`) with real timestamps/dates (`period` / `date`), not "Invalid date".
 - No hardcoded values unless explicitly agreed.
 

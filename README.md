@@ -6,6 +6,8 @@ The platform's daily flow is one Step Functions state machine (`zeus-dev-daily-p
 
 Format per entry: the decision, alternatives considered, why the chosen option won, and known trade-offs.
 
+This file covers **platform/infra** decisions. Modeling and business-rule decisions for the dbt layer (grain, metric definitions, join semantics) live in [`transform/DECISIONS.md`](transform/DECISIONS.md), numbered `M-N` in the same format.
+
 ---
 
 # Cross-cutting decisions
