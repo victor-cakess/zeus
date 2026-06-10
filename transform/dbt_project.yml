@@ -26,3 +26,8 @@ models:
     intermediate:
       +materialized: view
       +schema: intermediate
+    # marts: the consumption surface — cross-source facts. Materialization is
+    # per-model in _marts__models.yml (incremental hourly fact, plain-table daily
+    # mart; DECISIONS.md M-5).
+    marts:
+      +schema: marts
