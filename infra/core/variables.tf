@@ -54,3 +54,8 @@ variable "transformer_public_key" {
   type        = string
   description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_TRANSFORMER service user (dbt). The matching private key stays local for dbt runs; nothing secret here."
 }
+
+variable "ci_public_key" {
+  type        = string
+  description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_CI service user (GitHub Actions dbt clone CI). The matching private key lives in GitHub Actions secrets; nothing secret here."
+}

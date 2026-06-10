@@ -326,6 +326,29 @@ rows = [normalize_row(r, today)
 
 ---
 
+## 15. PR-time dbt validation: build against a zero-copy clone of `ZEUS_DEV`
+
+**Chosen:** A second workflow (`.github/workflows/dbt-clone-ci.yml`, PRs touching `transform/**` only) runs the full warehouse gate per PR: `CREATE OR REPLACE DATABASE ZEUS_CI_PR_<n> CLONE ZEUS_DEV` (zero-copy) → `dbt build` against the clone → `DROP` with `if: always()`. The build is fully isolated by construction: `profiles.yml` and the sources yml both resolve the database from `SNOWFLAKE_DATABASE`, so even landing reads come from the clone. Clone lifecycle is two `dbt run-operation` macros (`transform/macros/ci/clone.sql`) with the `ZEUS_CI_PR_` prefix hardcoded and a digits-only suffix guard — they cannot name a non-CI database, and `CREATE OR REPLACE` self-heals any clone leaked by a dead runner. Auth is a dedicated key-pair service user `ZEUS_DEV_CI` / role `ZEUS_DEV_CI_ROLE` (`infra/core/snowflake_ci.tf`) with `CREATE DATABASE` + USAGE on `ZEUS_DEV` and the warehouse, **plus the transformer role granted into it**: cloning copies each child object's grants/ownership from the source (the cloning role owns only the database shell), so transformer privileges are the only ones that work inside the clone.
+
+**Alternatives considered:**
+- **`dbt build` against `ZEUS_DEV` directly** — mutates the shared database from un-merged code; a broken PR leaves prod models broken.
+- **A persistent CI database** — drifts from prod immediately; the incremental marts would merge against stale state, which is exactly the bug class the clone exists to catch.
+- **Run CI as the transformer user** — same effective privileges, but the key would be shared between the dbt Lambda's SSM secret and GitHub secrets: no independent rotation/revocation, no distinct audit identity.
+- **A dedicated CI warehouse** — considered for cost isolation, then dropped: `ZEUS_DEV_WH` already auto-suspends at 60 s, so a second x-small warehouse would buy nothing but another resource.
+- **Slim CI (`state:modified+`)** — needs a stored production manifest; upgrade path once builds are slow enough to care, not a starting point.
+
+**Why:**
+- The offline `dbt parse` gate can't catch SQL that fails in Snowflake, failing tests, or incremental-merge bugs; before this, those surfaced in the next morning's cron — in production, after merge.
+- The clone carries the marts' real state, so the incremental merge path runs exactly as in prod — the one thing a fresh database can't test (and the reason this was built only after the marts landed).
+- Zero-copy clones are metadata-only: free to create, a few cents of x-small compute per run, dropped within minutes.
+
+**Trade-offs:**
+- Via the inherited transformer role, the CI key can read landing tables and rebuild/drop modeled schemas in `ZEUS_DEV` itself (all dbt-rebuildable; no landing writes). Forced by clone grant semantics; acceptable for a dev database.
+- Forked PRs can't read repo secrets, so the workflow fails at the key step — fine for a solo repo, revisit with collaborators.
+- A runner killed mid-job can leak `ZEUS_CI_PR_<n>` until the next push replaces it (or it's dropped manually); no janitor until leftovers are actually observed.
+
+---
+
 # Pipeline-specific decisions
 
 ## EIA pipeline
