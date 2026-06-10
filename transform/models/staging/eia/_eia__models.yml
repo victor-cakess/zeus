@@ -24,6 +24,12 @@ models:
         description: Generation for the hour/fuel, in megawatthours.
       - name: value_units
         description: Source units string (constant "megawatthours").
+        # Units contract — if EIA ever changes the unit, every MWh column upstream
+        # of the marts is wrong; fail loudly here (verified empirically 2026-06-10).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["megawatthours"]
       - name: ingestion_date
         description: Date this row was ingested; used to pick the latest on dedup.
     # Output assertion of the grain spec.
