@@ -1,0 +1,25 @@
+# dbt connection profile — project-local so the whole setup is self-contained.
+# Run dbt from this directory (transform/) and it picks this up automatically.
+#
+# Nothing secret here: every value is an env var. Auth is key-pair — point
+# SNOWFLAKE_PRIVATE_KEY_FILE at the ZEUS_DEV_TRANSFORMER private key (gitignored,
+# *.p8). Same env-var names the backfill scripts already use.
+#
+#   export SNOWFLAKE_ACCOUNT=<org>-<account>            # org-account form
+#   export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/stuff stuff.p8"
+#   dbt debug   # then: dbt deps && dbt build
+zeus:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'ZEUS_DEV_TRANSFORMER') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'ZEUS_DEV_TRANSFORMER_ROLE') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_FILE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'ZEUS_DEV') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'ZEUS_DEV_WH') }}"
+      # Fallback schema for any model without an explicit +schema. The staging
+      # models override this to STAGING via generate_schema_name.
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'PUBLIC') }}"
+      threads: 4

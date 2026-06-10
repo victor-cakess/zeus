@@ -1,0 +1,73 @@
+# Phase 1 CI — offline gates only: no AWS/Snowflake credentials, no state access.
+# Mirrors the local pre-commit + done-means offline checks so a PR can't merge
+# with secrets, unparseable dbt, or invalid/unformatted Terraform.
+#
+# Later phases (deliberately not here yet — see the CI section in CLAUDE.md):
+#   Phase 2: dbt build on PRs against a zero-copy clone of ZEUS_DEV
+#            (needs a least-privilege CI Snowflake user + key in repo secrets).
+#   Phase 3: terraform plan on PRs (blocked on migrating state to an S3 backend
+#            + AWS OIDC for the runner — local state today).
+
+name: ci
+
+# pull_request has no branch filter on purpose: it fires on PRs to ANY base
+# (the daily flow targets dev; main only receives promotions from dev).
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # Same hooks as local commits (.pre-commit-config.yaml: gitleaks).
+      - run: uvx pre-commit run --all-files --show-diff-on-failure
+
+  dbt-parse:
+    runs-on: ubuntu-latest
+    env:
+      # parse compiles the project without connecting; dummy values just satisfy
+      # profiles.yml's env_var() lookups (same trick as the Dockerfile's dbt deps).
+      SNOWFLAKE_ACCOUNT: ci-dummy
+      SNOWFLAKE_PRIVATE_KEY_FILE: /dev/null
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --group dbt
+      - run: uv run dbt deps
+        working-directory: transform
+      # --profiles-dir .: be explicit that the project-local profile is the one
+      # in use (the runner has no ~/.dbt to fall back to).
+      - run: uv run dbt parse --profiles-dir .
+        working-directory: transform
+
+  terraform:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        root:
+          - core
+          - pipelines/eia
+          - pipelines/noaa
+          - pipelines/digest
+          - pipelines/dbt
+          - pipelines/orchestration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+        working-directory: infra/${{ matrix.root }}
+      # -backend=false: validate needs providers, not state (state is local-only;
+      # remote_state data sources are not resolved by validate).
+      - run: terraform init -backend=false -input=false
+        working-directory: infra/${{ matrix.root }}
+      - run: terraform validate
+        working-directory: infra/${{ matrix.root }}

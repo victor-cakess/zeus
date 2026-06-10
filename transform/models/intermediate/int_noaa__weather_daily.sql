@@ -18,7 +18,9 @@ aggregated as (
         count(distinct station) as station_count,
         avg(tmax) as tmax,
         avg(tmin) as tmin,
-        avg(tavg) as tavg,
+        -- derived, NOT the raw TAVG datatype (99.9% null in our station set) —
+        -- DECISIONS.md M-3; null when either input mean is null (honest nulls)
+        (avg(tmax) + avg(tmin)) / 2 as tavg,
         avg(prcp) as prcp,
         avg(snow) as snow,
         avg(snwd) as snwd,

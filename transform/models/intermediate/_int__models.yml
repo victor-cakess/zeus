@@ -3,8 +3,9 @@ version: 2
 models:
   - name: int_eia__generation_hourly
     description: >
-      EIA generation per (ba, period): total + renewable MWh and renewable share.
-      Hourly grain preserved (aggregate late). Renewables = SUN + WND + WAT.
+      EIA generation per (ba, period): net + gross total MWh, renewable MWh, and
+      renewable share. Hourly grain preserved (aggregate late). Renewables =
+      SUN + WND + WAT, computed over gross-positive generation (DECISIONS.md M-1/M-2).
     columns:
       - name: ba
         description: Balancing-authority code. Join key to NOAA weather.
@@ -12,12 +13,26 @@ models:
       - name: period
         description: Hour of generation, UTC (timestamp_ntz).
         data_tests: [not_null]
-      - name: total_mwh
-        description: Total generation across all fuel types for the hour (MWh).
-      - name: renewable_mwh
-        description: Solar + wind + hydro generation for the hour (MWh).
+      - name: total_net_mwh
+        description: >
+          Net generation across all fuel types for the hour (MWh), negatives included
+          (storage charging, pumping). Use for demand-proxy / trend work.
+      - name: total_gross_mwh
+        description: >
+          Gross production for the hour (MWh) — each fuel value clamped at 0 before
+          summing. The renewable_share denominator (M-1).
+      - name: renewable_gross_mwh
+        description: Solar + wind + hydro gross production for the hour (MWh), clamped at 0.
       - name: renewable_share
-        description: renewable_mwh / total_mwh; null when total is 0.
+        description: >
+          renewable_gross_mwh / total_gross_mwh — in [0, 1] by construction (M-1);
+          null when the BA-hour produced no gross generation.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:
@@ -27,7 +42,9 @@ models:
     description: >
       NOAA weather aggregated to (ba, observation_date) as the areal mean across the
       BA's stations. WDF2 (wind direction) dropped — circular quantity. Datatype columns
-      keep their codes but are now BA-level station means.
+      keep their codes but are now BA-level station means. tavg is derived from
+      tmax/tmin, not the raw TAVG datatype (DECISIONS.md M-3); sparse datatypes
+      (snow, rhav, aslp, adpt) stay null where stations don't report them.
     columns:
       - name: ba
         description: Balancing-authority code. Join key to EIA generation.
@@ -42,7 +59,9 @@ models:
       - name: tmin
         description: Mean across stations of daily min temperature (°C).
       - name: tavg
-        description: Mean across stations of daily average temperature (°C).
+        description: >
+          Derived daily average temperature (°C) — (tmax + tmin) / 2 over the BA-level
+          means, NOT the raw TAVG datatype (99.9% null in our station set; M-3).
       - name: prcp
         description: Mean across stations of precipitation (mm).
       - name: snow
