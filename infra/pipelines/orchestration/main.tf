@@ -20,84 +20,46 @@ resource "aws_sfn_state_machine" "daily" {
     StartAt = "Ingest"
     States = {
       Ingest = {
-        Type = "Parallel"
-        # Branch order is load-bearing: CheckFailures reads $.ingest[0] (EIA)
-        # and $.ingest[1] (NOAA).
+        Type       = "Parallel"
         ResultPath = "$.ingest"
-        Branches = [
-          {
-            StartAt = "IngestEIA"
-            States = {
-              IngestEIA = {
-                Type     = "Task"
-                Resource = "arn:aws:states:::lambda:invoke"
-                Parameters = {
-                  FunctionName = local.eia_function_arn
-                  Payload      = { units = local.eia_balancing_authorities }
-                }
-                Retry = local.lambda_transient_retry
-                Catch = [{
-                  ErrorEquals = ["States.ALL"]
-                  ResultPath  = "$.errorInfo"
-                  Next        = "EIAFail"
-                }]
-                Next = "EIAOk"
+        # One branch per entry in local.ingest_sources: Ingest<S> → <S>Ok / <S>Fail.
+        # The Ok/Fail Pass states normalize every branch result to {source, failed}
+        # so the CheckFailures Choice never references a missing path.
+        Branches = [for s in local.ingest_sources : {
+          StartAt = "Ingest${upper(s.name)}"
+          States = {
+            ("Ingest${upper(s.name)}") = {
+              Type     = "Task"
+              Resource = "arn:aws:states:::lambda:invoke"
+              Parameters = {
+                FunctionName = s.function_arn
+                Payload      = { units = s.units }
               }
-              # Ok/Fail Pass states normalize every branch result to {source, failed}
-              # so the CheckFailures Choice never references a missing path.
-              EIAOk = {
-                Type   = "Pass"
-                Result = { source = "eia", failed = false }
-                End    = true
-              }
-              EIAFail = {
-                Type = "Pass"
-                Parameters = {
-                  source    = "eia"
-                  failed    = true
-                  "error.$" = "$.errorInfo.Error"
-                  "cause.$" = "$.errorInfo.Cause"
-                }
-                End = true
-              }
+              Retry = local.lambda_transient_retry
+              Catch = [{
+                ErrorEquals = ["States.ALL"]
+                ResultPath  = "$.errorInfo"
+                Next        = "${upper(s.name)}Fail"
+              }]
+              Next = "${upper(s.name)}Ok"
             }
-          },
-          {
-            StartAt = "IngestNOAA"
-            States = {
-              IngestNOAA = {
-                Type     = "Task"
-                Resource = "arn:aws:states:::lambda:invoke"
-                Parameters = {
-                  FunctionName = local.noaa_function_arn
-                  Payload      = { units = local.noaa_balancing_authorities }
-                }
-                Retry = local.lambda_transient_retry
-                Catch = [{
-                  ErrorEquals = ["States.ALL"]
-                  ResultPath  = "$.errorInfo"
-                  Next        = "NOAAFail"
-                }]
-                Next = "NOAAOk"
-              }
-              NOAAOk = {
-                Type   = "Pass"
-                Result = { source = "noaa", failed = false }
-                End    = true
-              }
-              NOAAFail = {
-                Type = "Pass"
-                Parameters = {
-                  source    = "noaa"
-                  failed    = true
-                  "error.$" = "$.errorInfo.Error"
-                  "cause.$" = "$.errorInfo.Cause"
-                }
-                End = true
-              }
+            ("${upper(s.name)}Ok") = {
+              Type   = "Pass"
+              Result = { source = s.name, failed = false }
+              End    = true
             }
-          },
-        ]
+            ("${upper(s.name)}Fail") = {
+              Type = "Pass"
+              Parameters = {
+                source    = s.name
+                failed    = true
+                "error.$" = "$.errorInfo.Error"
+                "cause.$" = "$.errorInfo.Cause"
+              }
+              End = true
+            }
+          }
+        }]
         Next = "Dbt"
       }
       # dbt build (models + tests). A failure — including failing tests — still
@@ -140,12 +102,19 @@ resource "aws_sfn_state_machine" "daily" {
       }
       CheckFailures = {
         Type = "Choice"
-        Choices = [
-          { Variable = "$.ingest[0].failed", BooleanEquals = true, Next = "NotifyFailure" },
-          { Variable = "$.ingest[1].failed", BooleanEquals = true, Next = "NotifyFailure" },
-          { Variable = "$.dbtError", IsPresent = true, Next = "NotifyFailure" },
-          { Variable = "$.digestError", IsPresent = true, Next = "NotifyFailure" },
-        ]
+        # $.ingest[i] indexes are derived from the same list as the branches, so
+        # branch order and failure checks can never diverge.
+        Choices = concat(
+          [for i, s in local.ingest_sources : {
+            Variable      = "$.ingest[${i}].failed"
+            BooleanEquals = true
+            Next          = "NotifyFailure"
+          }],
+          [
+            { Variable = "$.dbtError", IsPresent = true, Next = "NotifyFailure" },
+            { Variable = "$.digestError", IsPresent = true, Next = "NotifyFailure" },
+          ]
+        )
         Default = "Success"
       }
       NotifyFailure = {
@@ -203,12 +172,10 @@ resource "aws_iam_role_policy" "sfn" {
       {
         Effect = "Allow"
         Action = "lambda:InvokeFunction"
-        Resource = [
-          local.eia_function_arn,
-          local.noaa_function_arn,
-          local.dbt_function_arn,
-          local.digest_function_arn,
-        ]
+        Resource = concat(
+          [for s in local.ingest_sources : s.function_arn],
+          [local.dbt_function_arn, local.digest_function_arn],
+        )
       },
       {
         Effect   = "Allow"

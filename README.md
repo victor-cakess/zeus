@@ -314,11 +314,11 @@ rows = [normalize_row(r, today)
 - The user-facing requirements were: the digest must ALWAYS run, full end-to-end visibility, and preserved per-source failure detail. The Parallel-with-branch-Catch + final Choice shape delivers all three declaratively.
 - dbt joins the daily flow as a first-class step (it was previously manual), with its failure surfaced the same way as an ingest failure.
 - A bad day is **red** — in the SFN console, in CloudWatch metrics, and in the inbox — from a single alert point.
-- BA lists and function ARNs are consumed from each pipeline root's outputs, so the orchestration root duplicates nothing.
+- BA lists and function ARNs are consumed from each pipeline root's outputs, so the orchestration root duplicates nothing. One `ingest_sources` local derives the ingest Branches, the `CheckFailures` ingest rules, and the SFN role's invoke list — onboarding a source is one list entry plus its remote-state block.
 
 **Trade-offs:**
 - One more Terraform root, two more IAM roles (SFN execution + EventBridge trigger), and an apply-order constraint: the orchestration root must be applied **after** the roots whose outputs it consumes.
-- The `CheckFailures` rules reference `$.ingest[0]` / `$.ingest[1]` positionally — branch order in the definition is load-bearing (noted in `main.tf`).
+- The `CheckFailures` rules reference `$.ingest[i]` positionally — but branch order and rule index are derived from the same `ingest_sources` list, so they cannot diverge.
 - The failure alert is raw execution-state JSON; the human-readable detail intentionally lives in the digest email (decision 8).
 - Observed: a full execution (parallel ingest → dbt → digest) completes in ~30 s.
 
@@ -574,7 +574,7 @@ Runs `dbt build` (staging + intermediate models and their tests) over `transform
 
 ### DBT-1. Runner: a container-image Lambda
 
-**Chosen:** One Lambda, `zeus-dev-dbt-run` (2048 MB / 300 s), deployed as a **container image**: `FROM public.ecr.aws/lambda/python:3.12`, `pip install dbt-snowflake`, `COPY transform/` + `src/shared/` + the handler, and `dbt deps` baked at build time so the runtime never hits the package hub. The image lives in an ECR repo (`zeus-dev-dbt-run`, lifecycle policy keeps the last 3 images), tagged with a content hash over the Dockerfile/handler/`transform/`/`src/shared/` so any change forces a rebuild + push (the same fingerprint pattern as `lambda_job`'s zip builds; the docker build context is the repo root, allowlisted by `.dockerignore`). The Lambda resource is authored inline in `infra/pipelines/dbt/` — `lambda_job` stays zip-only (decision 10). The handler invokes dbt in-process via `dbtRunner` and authenticates as `ZEUS_DEV_TRANSFORMER` (key-pair; private key in SSM `/zeus/dev/snowflake/transformer_private_key`, fetched to `/tmp` per run — same secret contract as decisions 5–6).
+**Chosen:** One Lambda, `zeus-dev-dbt-run` (2048 MB / 300 s), deployed as a **container image**: `FROM public.ecr.aws/lambda/python:3.12`, `pip install dbt-snowflake`, `COPY transform/` + `src/shared/` + the handler, and `dbt deps` baked at build time so the runtime never hits the package hub. The image lives in an ECR repo (`zeus-dev-dbt-run`, lifecycle policy keeps the last 3 images), tagged with a content hash over the Dockerfile/runner `*.py`/`transform/`/`src/shared/` so any change forces a rebuild + push (the same fingerprint pattern as `lambda_job`'s zip builds; the docker build context is the repo root, allowlisted by `.dockerignore`). The Lambda resource is authored inline in `infra/pipelines/dbt/` — `lambda_job` stays zip-only (decision 10). The handler invokes dbt in-process via `dbtRunner` and authenticates as `ZEUS_DEV_TRANSFORMER` (key-pair; private key in SSM `/zeus/dev/snowflake/transformer_private_key`, fetched to `/tmp` per run — same secret contract as decisions 5–6).
 
 **Alternatives considered:**
 - **Zip Lambda (decision 7's pattern).** `dbt-snowflake` + its dependency tree plus the dbt project files don't fit the zip limits comfortably, and dbt expects a real filesystem project layout — the image COPYs `transform/` in as-is.
@@ -610,4 +610,4 @@ Runs `dbt build` (staging + intermediate models and their tests) over `transform
 The fix was verified **locally** by stubbing `_multiprocessing.SemLock` to raise inside the container and running the real handler against Snowflake — green locally meant green on Lambda first try. That stub-the-runtime-limitation harness is the fast way to debug dbt-in-Lambda issues without deploy cycles.
 
 **Trade-offs:**
-- Both patches reach into stdlib/dbt private internals and are the most upgrade-fragile code in the repo; they live in the handler with full rationale in comments, pinned to the dbt 1.11 / Python 3.12 pair in the image.
+- Both patches reach into stdlib/dbt private internals and are the most upgrade-fragile code in the repo; they live in `src/lambdas/dbt/lambda_mp_patch.py` behind one `apply()` entry point (the handler calls it before the `dbt.cli` import), with full rationale in the module docstring, pinned to the dbt 1.11 / Python 3.12 pair in the image.
