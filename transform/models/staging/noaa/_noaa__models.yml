@@ -17,32 +17,108 @@ models:
       - name: ba
         description: Balancing-authority code this station maps to. Join key to EIA grid.
         data_tests: [not_null]
+      # Physical-bounds tests (metric units verified empirically 2026-06-10):
+      # severity warn on tmin/awnd/wsf5 — one known sensor-garbage row each
+      # (e.g. USW00003954 2019-08-02 tmin -72.7); upgrade to error if a QC-null
+      # rule ever lands.
       - name: tmax
         description: Max temperature (°C).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -60
+                max_value: 60
+                inclusive: true
       - name: tmin
         description: Min temperature (°C).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -60
+                max_value: 60
+                inclusive: true
+              config:
+                severity: warn
       - name: tavg
         description: Average temperature (°C).
       - name: prcp
         description: Precipitation (mm).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1000
+                inclusive: true
       - name: snow
         description: Snowfall (mm).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 2500
+                inclusive: true
       - name: snwd
         description: Snow depth (mm).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 12000
+                inclusive: true
       - name: awnd
         description: Average daily wind speed (m/s).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 50
+                inclusive: true
+              config:
+                severity: warn
       - name: wsf2
         description: Fastest 2-minute wind speed (m/s).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+                inclusive: true
       - name: wsf5
         description: Fastest 5-second wind speed (m/s).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 120
+                inclusive: true
+              config:
+                severity: warn
       - name: wdf2
         description: Direction of fastest 2-minute wind (degrees).
       - name: rhav
         description: Average relative humidity (%).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+                inclusive: true
       - name: aslp
         description: Average sea-level pressure (hPa).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 870
+                max_value: 1090
+                inclusive: true
       - name: adpt
         description: Average dew point (°C).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -60
+                max_value: 40
+                inclusive: true
       - name: ingestion_date
         description: Date this row was ingested; used to pick the latest on dedup.
     # Output assertion of the grain spec.
