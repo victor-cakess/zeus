@@ -236,3 +236,40 @@ corr(TMAX, daily gross MWh) = 0.76 same-day, 0.83 prior-day, 0.55 next-day. The
 past>future asymmetry is physical (cooling load lags heat — thermal inertia) plus
 the documented boundary skew; downstream forecast features should include lagged
 weather, not just same-day.
+
+---
+
+## M-8. Physical-bounds tests at staging: surface bad sensor values, don't clean them
+
+**Chosen:** every NOAA measure column with a physical interpretation carries a
+`dbt_utils.accepted_range` output assertion in the staging `schema.yml`, bounds set
+at physical-extreme plausibility (validated against the full history, 2026-06-10).
+Out-of-range values are **surfaced, never mutated** — staging stays cleaning-only
+per the layering rule. Columns with known sensor-garbage rows in history run at
+`severity: warn`; the rest at the default `error`. (EIA staging also pins
+`value_units` to its documented constant — a units contract, same
+fail-loudly-at-staging principle.)
+
+**Alternatives considered:**
+- **QC-null rule in staging (null out-of-range values)** — a judgment call, which
+  staging is forbidden by design; it also silently destroys evidence. If a QC rule
+  ever lands it belongs in intermediate, at which point the warn tests upgrade to
+  error (noted in the yml).
+- **`severity: error` everywhere** — the known garbage rows are years old and
+  already understood; failing every future build over them turns the dbt step (and
+  the daily execution) permanently red for non-news.
+- **No bounds tests (trust NCEI QC)** — the known garbage rows passed NCEI QC;
+  without output assertions the next one reaches the mart unannounced.
+
+**Why:**
+- Bad sensor values are real in the data (a −72.7 °C Texas `tmin`), so plausibility
+  is an output assertion worth enforcing, not an assumption.
+- Warn severity reports the rows in every build without failing the pipeline —
+  the right cost for known, low-volume, historical garbage.
+
+**Trade-offs:**
+- Warn results don't page anyone; a slow accumulation of new garbage rows would
+  only be noticed by reading build output.
+- Bounds wide enough for genuine extremes can't catch plausible-but-wrong values.
+- The specific bounds and the warn-column list live in the yml (the contract);
+  this entry records only the policy.
