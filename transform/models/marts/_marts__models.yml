@@ -1,0 +1,124 @@
+version: 2
+
+models:
+  - name: fct_generation_hourly
+    description: >
+      Hourly generation fact — the marts-layer materialization of
+      int_eia__generation_hourly (same grain, same M-1/M-2 columns), built
+      incremental so consumers stop recomputing the staging dedup over the full
+      landing table. One row per (ba, period). Each run merges a trailing 10-day
+      window of periods: revisions reach a period until it ages out of the 7-day
+      ingestion lookback (an 8-calendar-day span), +2 days operational slack (M-5).
+    config:
+      materialized: incremental
+      incremental_strategy: merge
+      unique_key: ['ba', 'period']
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+        data_tests: [not_null]
+      - name: period
+        description: Hour of generation, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: total_net_mwh
+        description: >
+          Net generation for the hour (MWh), negatives included (storage charging,
+          pumping). Use for demand-proxy / trend work (M-2).
+      - name: total_gross_mwh
+        description: >
+          Gross production for the hour (MWh) — fuel values clamped at 0 before
+          summing. The renewable_share denominator (M-1).
+      - name: renewable_gross_mwh
+        description: Solar + wind + hydro gross production for the hour (MWh).
+      - name: renewable_share
+        description: >
+          renewable_gross_mwh / total_gross_mwh — in [0, 1] by construction (M-1);
+          null when the BA-hour produced no gross generation.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, period]
+
+  - name: fct_energy_daily
+    description: >
+      The cross-source daily mart: EIA generation rolled up to (ba, date) joined
+      LEFT to NOAA weather (M-4). date is the UTC calendar day of period (M-7);
+      weather joins on its station-local observation_date as-is. Row existence
+      tracks generation — all 71 BAs appear; weather columns are null for the
+      57 BAs without coverage and inside NOAA's ~3-day publication lag.
+      renewable_share is the ratio of daily sums, not the mean of hourly shares
+      (M-6). Plain table, rebuilt from fct_generation_hourly each run (M-5).
+    config:
+      materialized: table
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+        data_tests: [not_null]
+      - name: date
+        description: UTC calendar day of the generation periods (M-7).
+        data_tests: [not_null]
+      - name: total_net_mwh
+        description: Daily sum of hourly net generation (MWh), negatives included.
+      - name: total_gross_mwh
+        description: Daily sum of hourly gross production (MWh).
+      - name: renewable_gross_mwh
+        description: Daily sum of hourly renewable gross production (MWh).
+      - name: renewable_share
+        description: >
+          sum(renewable_gross_mwh) / sum(total_gross_mwh) over the day — ratio of
+          sums, NOT the average of hourly shares (M-6); null when the day produced
+          no gross generation.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+      - name: hours_reported
+        description: >
+          Distinct generation hours behind this BA-day (completeness signal —
+          coverage gaps exist, worst BA ~1.2% of hours). 24 = complete day.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 24
+                inclusive: true
+      - name: station_count
+        description: >
+          Stations behind the BA-day's weather means; null when no weather joined
+          (uncovered BA or NOAA lag — M-4).
+      - name: tmax
+        description: BA-mean daily max temperature (°C); nullable (M-4).
+      - name: tmin
+        description: BA-mean daily min temperature (°C); nullable (M-4).
+      - name: tavg
+        description: Derived (tmax + tmin) / 2 over BA-level means (M-3); nullable (M-4).
+      - name: prcp
+        description: BA-mean precipitation (mm); nullable (M-4).
+      - name: snow
+        description: BA-mean snowfall (mm); null where stations don't report it (M-3/M-4).
+      - name: snwd
+        description: BA-mean snow depth (mm); nullable (M-3/M-4).
+      - name: awnd
+        description: BA-mean average daily wind speed (m/s); nullable (M-4).
+      - name: wsf2
+        description: BA-mean fastest 2-minute wind speed (m/s); nullable (M-4).
+      - name: wsf5
+        description: BA-mean fastest 5-second wind speed (m/s); nullable (M-4).
+      - name: rhav
+        description: BA-mean average relative humidity (%); null where unreported (M-3/M-4).
+      - name: aslp
+        description: BA-mean sea-level pressure (hPa); null where unreported (M-3/M-4).
+      - name: adpt
+        description: BA-mean dew point (°C); null where unreported (M-3/M-4).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, date]

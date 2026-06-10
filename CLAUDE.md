@@ -256,6 +256,15 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
 - Event payload contract: the state machine invokes each ingest Lambda with `{"units": [...]}` (baked into the ASL from the pipeline roots' `balancing_authorities` outputs); the handler reads `event["units"]`. The same contract works for any fan-out source. The dbt and digest steps take `{}`.
 - Shared AWS clients (`src/shared/{s3_io,ssm,sns,snowflake_io}.py`) are module-level singletons by convention; tests substitute them by monkeypatching module attributes (see the dbt container test harness). Keep new shared helpers consistent.
 
+### dbt layering (every source walks the same four steps)
+
+- **landing** (`<SOURCE>.<SOURCE>_GRID`) — truth as received: append-only, raw API names, duplicated by the lookback overlap. Never edited, never queried by consumers.
+- **staging** (`stg_<source>__*`, view) — cleaning only: dedup the lookback overlap (keep latest `ingestion_date`) + rename to standard names. Same grain as landing, zero judgment — if a transformation requires a decision, it does NOT belong here.
+- **intermediate** (`int_<source>__*`, view) — business rules and grain changes (aggregation, derived metrics, unit rollups). Every judgment call gets an `M-N` entry in `transform/DECISIONS.md`; the enforceable contract goes in the layer's `schema.yml`.
+- **marts** (`fct_*`, table/incremental) — the cross-source consumption surface and the only layer consumers may depend on. No new business logic beyond cross-source joins/rollups; materialization per M-5.
+
+Onboarding a new source (e.g. FRED) = one `stg_` + one or more `int_` models + sources yml + tests, then join it into (or alongside) the marts. Schemas come from `generate_schema_name` (STAGING / INTERMEDIATE / MARTS).
+
 ### CI (GitHub Actions)
 - **Phase 1 (live):** `.github/workflows/ci.yml` runs the offline gates on every PR and push to main — pre-commit (gitleaks), `dbt parse` (dummy creds; parse doesn't connect), and per-root `terraform fmt -check` + `validate` (`init -backend=false` — no state, no cloud creds). It automates the cheap end of "Done means"; the warehouse- and AWS-touching tiers stay local for now.
 - **Phase 2 (planned — dbt clone CI):** on PR, `CREATE DATABASE ZEUS_CI_PR_<n> CLONE ZEUS_DEV` (zero-copy, instant) → `dbt build` against the clone (`SNOWFLAKE_DATABASE` env var — profiles.yml is already env-var driven, zero code change) → drop the clone. Prereqs: a least-privilege CI Snowflake service user + role (same key-pair pattern as the loaders, provisioned in `infra/core`), private key in GitHub Actions secrets. Upgrade path: Slim CI (`state:modified+`) once a production manifest is stored. **Trigger to build it:** the marts layer landing (incremental tables make clone isolation actually matter; views barely need it).

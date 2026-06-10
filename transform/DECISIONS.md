@@ -147,3 +147,92 @@ without weather coverage.
 - Freshness tests must be source-aware: generation columns near-current, weather
   columns tested with a ~5-day tolerance so the normal lag doesn't page anyone.
 - Consumers averaging weather columns must expect nulls at the head of the series.
+
+---
+
+## M-5. Marts materialization: incremental hourly fact, plain-table daily mart
+
+**Chosen:** `fct_generation_hourly` is **incremental** (merge on `(ba, period)`,
+reprocessing a trailing 10-day window each run). Window derivation: a period keeps
+receiving revised rows until it ages out of the 7-day ingestion lookback — an
+8-calendar-day span with boundaries included — plus 2 days of operational slack
+(a missed run fixed later, same-day re-runs). Too-small window = revisions land in
+staging but never reach the fact, **silently and permanently**; too-big = a few
+extra seconds of scan. The window is derived from the lookback — if the lookback
+changes, this changes with it. `fct_energy_daily` is a plain **table**, rebuilt
+each run from the hourly fact. Staging/intermediate stay views.
+
+**Alternatives considered:**
+- **Marts as views** — every consumer query recomputes the staging dedup window
+  over the full landing table (24M+ rows); fine for the modeling layers,
+  unacceptable as the repeated-consumption surface.
+- **Full-refresh table for the hourly fact** — rebuild cost grows unbounded with
+  history for data that is immutable past the revision window.
+- **Incremental daily mart** — ~165K rows reading from an already-materialized
+  fact; incremental machinery would be complexity without payoff.
+
+**Why:**
+- The hourly fact is the high-volume surface; incremental + merge handles the
+  late-arriving revisions the lookback exists for, paying only for the window.
+- The 10-day window is tied to the ingestion lookback — if the lookback changes,
+  this window changes with it.
+
+**Trade-offs:**
+- Incremental models need `--full-refresh` discipline on schema/logic changes.
+- The daily mart re-reads the whole fact each run; revisit if rebuild time grows.
+
+---
+
+## M-6. Daily renewable share: ratio of sums, not mean of hourly shares
+
+**Chosen:** `fct_energy_daily.renewable_share =
+sum(renewable_gross_mwh) / sum(total_gross_mwh)` over the day's hours.
+
+**Alternatives considered:**
+- **avg(hourly renewable_share)** — weights every hour equally, so a 3 AM hour
+  with tiny total generation counts as much as the evening peak; the "daily share"
+  would not equal renewable MWh over total MWh and would contradict the daily
+  totals displayed next to it.
+
+**Why:**
+- Ratio of sums weights every MWh equally and is self-consistent: the share equals
+  the ratio of the two daily totals in the same row.
+
+**Trade-offs:**
+- Consumers who naively average the hourly share will get a (slightly) different
+  number than the mart's; the column doc states the rule.
+
+---
+
+## M-7. Daily grain day = UTC calendar day; weather joins station-local day as-is
+
+**Chosen:** `fct_energy_daily.date` is the UTC calendar day of `period`
+(`period::date`). NOAA weather joins on its station-local `observation_date`
+unshifted — the ≤1-day boundary skew is documented, not corrected.
+
+**Alternatives considered:**
+- **Shift weather to UTC days** — impossible without sub-daily weather; NOAA
+  daily summaries have no intraday resolution to re-bucket.
+- **Roll generation up to BA-local days** — needs a per-BA timezone map + DST
+  handling, and breaks cross-BA comparability ("a day" stops meaning one thing).
+
+**Why:**
+- EIA periods are UTC; the UTC day is unambiguous, DST-free, and identical across
+  all 71 BAs.
+- At daily grain the skew is within weather's natural autocorrelation (adjacent
+  days are similar), and the dominant misalignment is NOAA's ~3-day publication
+  lag (M-4) anyway.
+
+**Trade-offs:**
+- A BA-day's weather is the station-local day overlapping most of that UTC day,
+  not an exact UTC window — fine for joins/features, not for hour-precise
+  attribution (which daily weather can't support regardless).
+
+**Empirical validation (2026-06-10):** periods confirmed UTC from the data itself —
+summer solar peaks at the recorded hours 21 (CISO), 18 (ERCO), 17 (ISNE), exactly
+each zone's local-afternoon peak expressed in UTC (a local-time encoding would peak
+~13 everywhere); zero future-dated periods. Join signal is strong: ERCO summer-2025
+corr(TMAX, daily gross MWh) = 0.76 same-day, 0.83 prior-day, 0.55 next-day. The
+past>future asymmetry is physical (cooling load lags heat — thermal inertia) plus
+the documented boundary skew; downstream forecast features should include lagged
+weather, not just same-day.
