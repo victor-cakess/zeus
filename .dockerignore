@@ -1,5 +1,8 @@
 # The dbt image build uses the repo root as context (it COPYs transform/ and src/).
 # Allowlist only what the Dockerfile needs so the context stays small.
+# Image contents are declared in three places — this allowlist, the Dockerfile's
+# COPYs (src/lambdas/dbt/Dockerfile), and the image_hash fingerprint in
+# infra/pipelines/dbt/locals.tf. Keep them in sync.
 *
 !transform/
 !src/shared/

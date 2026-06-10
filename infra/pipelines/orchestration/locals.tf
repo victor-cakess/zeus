@@ -7,14 +7,28 @@ locals {
 
   alerts_topic_arn = data.terraform_remote_state.core.outputs.alerts_topic_arn
 
-  eia_function_arn    = data.terraform_remote_state.eia.outputs.ingest_function_arn
-  noaa_function_arn   = data.terraform_remote_state.noaa.outputs.ingest_function_arn
   dbt_function_arn    = data.terraform_remote_state.dbt.outputs.function_arn
   digest_function_arn = data.terraform_remote_state.digest.outputs.digest_function_arn
 
-  # BA lists come from each pipeline's state — single source of truth, no duplication.
-  eia_balancing_authorities  = data.terraform_remote_state.eia.outputs.balancing_authorities
-  noaa_balancing_authorities = data.terraform_remote_state.noaa.outputs.balancing_authorities
+  # One entry per fan-out ingest source (function ARNs + unit lists come from each
+  # pipeline's state — single source of truth, no duplication). The state machine's
+  # Branches, the CheckFailures Choice rules, and the SFN role's
+  # lambda:InvokeFunction list are ALL derived from this list — adding a source is
+  # adding an entry here (plus its remote_state data source). List order defines
+  # branch order and $.ingest[i]. dbt/digest stay out: they are pipeline stages,
+  # not fan-out sources.
+  ingest_sources = [
+    {
+      name         = "eia"
+      function_arn = data.terraform_remote_state.eia.outputs.ingest_function_arn
+      units        = data.terraform_remote_state.eia.outputs.balancing_authorities
+    },
+    {
+      name         = "noaa"
+      function_arn = data.terraform_remote_state.noaa.outputs.ingest_function_arn
+      units        = data.terraform_remote_state.noaa.outputs.balancing_authorities
+    },
+  ]
 
   # Retry only AWS-transient invoke failures; a function error (crash, total outage)
   # goes straight to the branch Catch — retrying a code bug just doubles the run.

@@ -19,10 +19,12 @@ locals {
   # Image fingerprint — any change to the runner code, the dbt project, or the
   # shared helpers forces a rebuild + push (mirrors lambda_job's build triggers).
   # dbt_packages/ and target/ are local artifacts, deliberately not fingerprinted.
+  # Image contents are declared in three places — the Dockerfile's COPYs, the
+  # repo-root .dockerignore allowlist, and this fingerprint (entries ordered to
+  # mirror the Dockerfile's COPY order). Keep them in sync.
   image_hash = sha1(join("", concat(
     [
       filesha1("${local.dbt_src}/Dockerfile"),
-      filesha1("${local.dbt_src}/handler.py"),
       filesha1("${local.dbt_src}/requirements.txt"),
       filesha1("${local.transform_dir}/dbt_project.yml"),
       filesha1("${local.transform_dir}/profiles.yml"),
@@ -33,6 +35,7 @@ locals {
     [for f in sort(fileset("${local.transform_dir}/tests", "**/*.{sql,yml}")) : filesha1("${local.transform_dir}/tests/${f}")],
     [for f in sort(fileset("${local.transform_dir}/seeds", "**/*.{csv,yml}")) : filesha1("${local.transform_dir}/seeds/${f}")],
     [for f in sort(fileset("${local.repo_root}/src/shared", "**/*.py")) : filesha1("${local.repo_root}/src/shared/${f}")],
+    [for f in sort(fileset(local.dbt_src, "*.py")) : filesha1("${local.dbt_src}/${f}")],
   )))
 
   registry = split("/", aws_ecr_repository.dbt.repository_url)[0]

@@ -66,6 +66,30 @@ def format_email(
     return subject, "\n".join(lines)
 
 
+def build_dbt_report(d: date, res) -> dict:
+    """Shape a dbtRunner result into the dbt run report that format_dbt_section
+    renders. res is duck-typed (success/exception/result.results) so this module
+    never imports dbt; res.result can be None (e.g. parse/connection failure
+    before anything ran)."""
+    results = getattr(res.result, "results", None) or []
+    models_built = sum(
+        1
+        for r in results
+        if str(r.node.resource_type) == "model" and str(r.status) == "success"
+    )
+    tests = [r for r in results if str(r.node.resource_type) == "test"]
+    failed_tests = [r.node.name for r in tests if str(r.status) in ("fail", "error")]
+    return {
+        "date": d.isoformat(),
+        "status": "ok" if res.success else "failed",
+        "models_built": models_built,
+        "tests_passed": sum(1 for r in tests if str(r.status) == "pass"),
+        "tests_failed": len(failed_tests),
+        "failed_tests": failed_tests,
+        "error": str(res.exception) if res.exception else None,
+    }
+
+
 def format_dbt_section(dbt_report: dict | None) -> tuple[str, str]:
     """Subject chip + body block for the daily dbt run. dbt isn't a fan-out source
     (no succeeded/skipped units), so it gets its own section, not a source section.
