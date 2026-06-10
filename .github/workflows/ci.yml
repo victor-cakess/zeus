@@ -43,7 +43,9 @@ jobs:
       - run: uv sync --group dbt
       - run: uv run dbt deps
         working-directory: transform
-      - run: uv run dbt parse
+      # --profiles-dir .: be explicit that the project-local profile is the one
+      # in use (the runner has no ~/.dbt to fall back to).
+      - run: uv run dbt parse --profiles-dir .
         working-directory: transform
 
   terraform:
