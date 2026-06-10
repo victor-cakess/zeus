@@ -10,12 +10,15 @@ Python 3.12+ project managed with `uv`. The repo is a data platform for energy d
 
 ```
 .github/workflows/ci.yml          # PR/push offline gates: gitleaks + dbt parse + terraform fmt/validate (see Working norms → CI)
+.github/workflows/dbt-clone-ci.yml # PR gate (transform/** only): dbt build against a zero-copy clone of ZEUS_DEV, then drop it
 infra/
   core/                           # Terraform root: shared S3 bucket + SNS alerts topic + Snowflake warehouse/db + per-source Snowflake DDL
     backend.tf, providers.tf, variables.tf, locals.tf, main.tf, sns.tf, outputs.tf
     snowflake.tf                  # shared ZEUS_DEV database
     snowflake_eia.tf              # module "eia_landing"  — EIA storage integration + ZEUS_DEV.EIA DDL + loader
     snowflake_noaa.tf             # module "noaa_landing" — NOAA storage integration + ZEUS_DEV.NOAA DDL + loader
+    snowflake_transform.tf        # ZEUS_DEV_TRANSFORMER role + key-pair user (dbt: read landing, own modeled schemas)
+    snowflake_ci.tf               # ZEUS_DEV_CI role + key-pair user (GitHub Actions dbt clone CI; inherits transformer)
   modules/
     lambda_job/                   # one Lambda + IAM role + ZIP-via-S3 packaging
     snowflake_landing/            # one source's Snowflake landing stack (integration + IAM trust + schema/table/stage + key-pair loader); names derived from source_name
@@ -104,12 +107,13 @@ README.md                         # project overview + architectural decisions
 
 ### Snowflake (live)
 
-- **Shared:** warehouse `ZEUS_DEV_WH` (x-small, auto-suspend 60 min, auto-resume) in `infra/core/main.tf`; database `ZEUS_DEV` in `infra/core/snowflake.tf`.
+- **Shared:** warehouse `ZEUS_DEV_WH` (x-small, auto-suspend 60 s, auto-resume) in `infra/core/main.tf`; database `ZEUS_DEV` in `infra/core/snowflake.tf`.
 - **Per-source landing stacks** are one `module "snowflake_landing"` call each (`snowflake_eia.tf`, `snowflake_noaa.tf`). The module derives every name from `source_name` and takes the table columns as a variable. Each call creates: a storage integration (`ZEUS_DEV_<SOURCE>_S3_INT`) + paired AWS IAM role (`zeus-dev-snowflake-<source>`), the schema + `<SOURCE>_GRID` table + `<SOURCE>_STAGE` over `curated/<source>/`, and a least-privilege key-pair loader (`ZEUS_DEV_<SOURCE>_LOADER`, USAGE + INSERT only).
   - **EIA:** `ZEUS_DEV.EIA.EIA_GRID`, stage `EIA_STAGE`. **NOAA:** `ZEUS_DEV.NOAA.NOAA_GRID`, stage `NOAA_STAGE`.
 - **Load path:** the ingest Lambda's `COPY INTO ... FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE) MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`. **`USE_LOGICAL_TYPE = TRUE` is required** — without it EIA's `period` loads as a raw INT64 and NOAA's `date` as a raw INT32 ("Invalid date").
 - **Auth:** public key in Terraform (`var.eia_loader_public_key` / `var.noaa_loader_public_key`), private key in SSM. Creating integrations + service users requires the `infra/core/` Snowflake provider to run as `ACCOUNTADMIN`.
 - **Transformer (dbt):** account role `ZEUS_DEV_TRANSFORMER_ROLE` + key-pair service user `ZEUS_DEV_TRANSFORMER` (`infra/core/snowflake_transform.tf`) — read-only on the landing schemas, `CREATE SCHEMA` on `ZEUS_DEV`, owns the modeled schemas; rolled up to SYSADMIN. Same key contract as the loaders: public key in tfvars (`var.transformer_public_key`), private key in SSM (`/zeus/dev/snowflake/transformer_private_key`) for the dbt Lambda; manual local dbt runs keep using the gitignored `sf_transformer.p8`.
+- **CI clone runner:** account role `ZEUS_DEV_CI_ROLE` + key-pair service user `ZEUS_DEV_CI` (`infra/core/snowflake_ci.tf`) — `CREATE DATABASE` on the account, USAGE on `ZEUS_DEV` + the warehouse, **plus the transformer role granted into it** (cloned child objects keep source grants/ownership, so only transformer privileges work inside a clone). Public key in tfvars (`var.ci_public_key`); private key in GitHub Actions secrets (`SNOWFLAKE_CI_PRIVATE_KEY`), local copy `sf_ci.p8` (gitignored). Used only by `.github/workflows/dbt-clone-ci.yml`.
 - **Table contract:** append-only landing; duplication from the lookback overlap is deduped downstream in dbt (EIA on `(period, respondent, fueltype)`, NOAA on `(date, station)`) keeping the latest `ingestion_date`. Per-file load metadata makes same-day re-runs idempotent.
 - **Module note:** EIA's landing resources were originally inline in `snowflake_eia.tf`; they were moved into the module via `terraform state mv` (no destroy/recreate — the module reproduces every name/comment exactly). See README cross-cutting decision for the move list.
 
@@ -127,11 +131,16 @@ uv run pre-commit run --all-files
 # (eia_loader_public_key, noaa_loader_public_key). Generate each key-pair once, e.g.:
 #   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out sf_noaa_loader.p8 -nocrypt
 #   openssl rsa -in sf_noaa_loader.p8 -pubout -out sf_noaa_loader.pub   # paste body into tfvars
-# (*.p8 and sf_*_loader.pub are gitignored.)
+# (*.p8 and *.pub are gitignored.) Same pattern for the transformer (sf_transformer.p8 →
+# var.transformer_public_key) and the clone-CI user (sf_ci.p8 → var.ci_public_key).
 cd infra/core
 terraform init
 terraform plan
 terraform apply
+
+# GitHub Actions secrets for the dbt clone CI (.github/workflows/dbt-clone-ci.yml)
+gh secret set SNOWFLAKE_ACCOUNT --body "$(terraform -chdir=infra/core output -raw snowflake_account)"
+gh secret set SNOWFLAKE_CI_PRIVATE_KEY < sf_ci.p8
 terraform output                          # bucket_name, bucket_arn, alerts_topic_arn, snowflake_warehouse_name, snowflake_account, snowflake_database_name
 
 # Terraform — EIA pipeline
@@ -266,8 +275,9 @@ SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
 Onboarding a new source (e.g. FRED) = one `stg_` + one or more `int_` models + sources yml + tests, then join it into (or alongside) the marts. Schemas come from `generate_schema_name` (STAGING / INTERMEDIATE / MARTS).
 
 ### CI (GitHub Actions)
-- **Phase 1 (live):** `.github/workflows/ci.yml` runs the offline gates on every PR and push to main — pre-commit (gitleaks), `dbt parse` (dummy creds; parse doesn't connect), and per-root `terraform fmt -check` + `validate` (`init -backend=false` — no state, no cloud creds). It automates the cheap end of "Done means"; the warehouse- and AWS-touching tiers stay local for now.
-- **Phase 2 (planned — dbt clone CI):** on PR, `CREATE DATABASE ZEUS_CI_PR_<n> CLONE ZEUS_DEV` (zero-copy, instant) → `dbt build` against the clone (`SNOWFLAKE_DATABASE` env var — profiles.yml is already env-var driven, zero code change) → drop the clone. Prereqs: a least-privilege CI Snowflake service user + role (same key-pair pattern as the loaders, provisioned in `infra/core`), private key in GitHub Actions secrets. Upgrade path: Slim CI (`state:modified+`) once a production manifest is stored. **Trigger to build it:** the marts layer landing (incremental tables make clone isolation actually matter; views barely need it).
+- **Phase 1 (live):** `.github/workflows/ci.yml` runs the offline gates on every PR and push to main — pre-commit (gitleaks), `dbt parse` (dummy creds; parse doesn't connect), and per-root `terraform fmt -check` + `validate` (`init -backend=false` — no state, no cloud creds). It automates the cheap end of "Done means"; the AWS-touching tiers stay local.
+- **Phase 2 (live — dbt clone CI):** `.github/workflows/dbt-clone-ci.yml` runs on PRs touching `transform/**`: `CREATE OR REPLACE DATABASE ZEUS_CI_PR_<n> CLONE ZEUS_DEV` (zero-copy) → `dbt build` against the clone (`SNOWFLAKE_DATABASE` env var; the sources yml resolves `target.database`, so landing reads come from the clone too — prod untouched) → `DROP` with `if: always()`. Clone lifecycle = `dbt run-operation` macros in `transform/macros/ci/clone.sql` (prefix hardcoded + digits-only suffix, so they can't touch non-CI databases; `CREATE OR REPLACE` self-heals leaked clones). Auth: service user `ZEUS_DEV_CI` / role `ZEUS_DEV_CI_ROLE` (`infra/core/snowflake_ci.tf`) — the transformer role is granted into the CI role because **cloned child objects keep the source's grants/ownership** (the clone owner owns only the database shell), so only transformer privileges work inside the clone. GitHub secrets: `SNOWFLAKE_ACCOUNT` + `SNOWFLAKE_CI_PRIVATE_KEY`. Forked PRs can't read secrets and fail at the key step (fine for a solo repo). Cost ~a few cents/run. Upgrade path: Slim CI (`state:modified+`) once a production manifest is stored.
+- **Incremental gotcha:** the clone carries the marts' state, so `dbt build` exercises the real incremental-merge path — but a PR that changes an incremental model's schema will fail in CI until it handles `on_schema_change` (or the PR is built `--full-refresh` after merge), which is the correct signal, not a CI bug.
 - **Phase 3 (deferred — Terraform plan on PRs):** blocked on migrating Terraform state from local to an S3 backend (+ DynamoDB locking) and AWS OIDC for the runner; the `local-exec` builds also need docker/uv/python3.12 on the runner. Do the backend migration as its own project first; don't bolt it onto CI.
 - **`/bin/sh: uv: not found` during `terraform apply`.** The Lambda build is a `local-exec` provisioner (`infra/modules/lambda_job/main.tf`) that Terraform runs under **`/bin/sh`** — a non-interactive, non-login shell that does **not** source your shell config. If `uv` is a shim/alias/shell function, or lives only on your interactive shell's PATH (common with version managers or a venv that doesn't ship `uv`), the build fails with `/bin/sh: uv: not found` **even though `uv` works fine in your terminal**. The fix is to put a **real `uv` binary** on a directory that's already on PATH for non-interactive shells — `~/.local/bin` works:
   ```bash

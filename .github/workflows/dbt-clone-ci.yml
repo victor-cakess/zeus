@@ -1,0 +1,75 @@
+# Phase 2 CI — dbt build on PRs against a zero-copy clone of ZEUS_DEV.
+#
+# Catches what the offline dbt-parse gate (ci.yml) can't: SQL that doesn't compile
+# in Snowflake, failing tests, and incremental-merge bugs (the clone carries the
+# marts' existing state, so the merge path runs exactly as in prod). Prod is never
+# written: profiles.yml + the sources yml both resolve the database from
+# SNOWFLAKE_DATABASE, so the build reads landing from the clone too.
+#
+# Separate workflow file (not a job in ci.yml): it needs its own paths: trigger
+# (per-job path filters don't exist) and it's the only workflow holding Snowflake
+# credentials. Auth is the ZEUS_DEV_CI key-pair user (infra/core/snowflake_ci.tf);
+# clone lifecycle is dbt run-operation macros (transform/macros/ci/clone.sql) so
+# the runner needs no SQL client beyond dbt. Forked PRs can't read the secrets and
+# will fail at the key step — acceptable for a solo repo.
+#
+# Cost: clone is metadata-only (free); the build is ~1-2 min on the x-small
+# warehouse (auto-suspend 60 s) → a few cents per run.
+
+name: dbt-clone-ci
+
+on:
+  pull_request:
+    paths:
+      - "transform/**"
+
+# One run per PR; a newer push cancels the older run (its always() drop step still
+# executes, and CREATE OR REPLACE self-heals any leftover clone on the next run).
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dbt-build-clone:
+    runs-on: ubuntu-latest
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ZEUS_DEV_CI
+      SNOWFLAKE_ROLE: ZEUS_DEV_CI_ROLE
+      SNOWFLAKE_WAREHOUSE: ZEUS_DEV_WH
+      SNOWFLAKE_PRIVATE_KEY_FILE: ${{ github.workspace }}/sf_ci_key.p8
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    defaults:
+      run:
+        working-directory: transform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --group dbt
+        working-directory: .
+      - run: uv run dbt deps
+
+      - name: Write Snowflake key
+        env:
+          CI_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_CI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$CI_PRIVATE_KEY" > "$SNOWFLAKE_PRIVATE_KEY_FILE"
+          chmod 600 "$SNOWFLAKE_PRIVATE_KEY_FILE"
+
+      # Clone create/drop connect to ZEUS_DEV (a database that exists, so the
+      # session context is valid); only the build targets the clone.
+      - name: Create clone
+        env:
+          SNOWFLAKE_DATABASE: ZEUS_DEV
+        run: uv run dbt run-operation ci_clone_create --args "{suffix: $PR_NUMBER}" --profiles-dir .
+
+      - name: dbt build against clone
+        env:
+          SNOWFLAKE_DATABASE: ZEUS_CI_PR_${{ github.event.pull_request.number }}
+        run: uv run dbt build --profiles-dir .
+
+      - name: Drop clone
+        if: always()
+        env:
+          SNOWFLAKE_DATABASE: ZEUS_DEV
+        run: uv run dbt run-operation ci_clone_drop --args "{suffix: $PR_NUMBER}" --profiles-dir .
