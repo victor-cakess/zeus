@@ -34,10 +34,15 @@ def lambda_handler(event, context) -> dict:
         (source, _todays_report(source, today), _skip_history(source, today))
         for source in SOURCES
     ]
-    subject, body = report.format_digest(today.isoformat(), sections, SKIP_HISTORY_DAYS)
+    # dbt renders as its own section, not a fan-out source — SOURCES stays eia,noaa.
+    dbt_report = _todays_report("dbt", today)
+    subject, body = report.format_digest(
+        today.isoformat(), sections, SKIP_HISTORY_DAYS, dbt_report
+    )
     sns.publish(SNS_TOPIC_ARN, subject, body)
     return {
         "date": today.isoformat(),
         "sources": SOURCES,
         "reported": [source for source, run_report, _ in sections if run_report is not None],
+        "dbt_reported": dbt_report is not None,
     }

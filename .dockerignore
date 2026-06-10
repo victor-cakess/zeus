@@ -1,0 +1,10 @@
+# The dbt image build uses the repo root as context (it COPYs transform/ and src/).
+# Allowlist only what the Dockerfile needs so the context stays small.
+*
+!transform/
+!src/shared/
+!src/lambdas/dbt/
+transform/dbt_packages/
+transform/target/
+transform/logs/
+transform/.user.yml

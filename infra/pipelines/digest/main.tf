@@ -10,9 +10,11 @@ locals {
 }
 
 # Daily digest Lambda: after both ingest pipelines run, reads each source's
-# run_report.json for the day and emails one combined summary. Replaces the
-# per-pipeline success emails (the ingest Lambdas keep only their on-failure alerts).
+# run_report.json for the day and emails one combined summary.
 # Adding a future source = append it to var.sources.
+# Invoked synchronously by the daily state machine (infra/pipelines/orchestration),
+# which owns scheduling and failure alerting — and always runs the digest, even
+# when an ingest step failed.
 module "digest" {
   source = "../../modules/lambda_job"
 
@@ -55,37 +57,4 @@ module "digest" {
       Resource = local.alerts_topic_arn
     },
   ]
-}
-
-# On-failure safety net: a crash in the digest itself routes to the alerts topic.
-resource "aws_lambda_function_event_invoke_config" "digest" {
-  function_name          = module.digest.function_name
-  maximum_retry_attempts = 0
-
-  destination_config {
-    on_failure {
-      destination = local.alerts_topic_arn
-    }
-  }
-}
-
-# Daily trigger, after both ingest runs. No payload — the handler reads SOURCES.
-resource "aws_cloudwatch_event_rule" "daily" {
-  name                = "${local.prefix}-reports-digest-daily"
-  description         = "Daily cross-source run-report digest email."
-  schedule_expression = var.schedule_cron
-}
-
-resource "aws_cloudwatch_event_target" "daily" {
-  rule      = aws_cloudwatch_event_rule.daily.name
-  target_id = "reports-digest"
-  arn       = module.digest.function_arn
-}
-
-resource "aws_lambda_permission" "allow_eventbridge" {
-  statement_id  = "AllowEventBridgeInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = module.digest.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.daily.arn
 }

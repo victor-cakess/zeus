@@ -28,12 +28,15 @@ data "archive_file" "this" {
 }
 
 # The package (pyarrow + snowflake-connector) is ~49 MiB zipped — too close to the
-# 50 MiB direct-upload limit, so deploy via S3 instead.
+# 50 MiB direct-upload limit, so deploy via S3 instead. source_hash, not etag: the
+# provider uploads files this large via multipart, whose S3 etag never equals the
+# plain md5, so etag-based change detection re-uploads on every apply.
 resource "aws_s3_object" "this" {
   bucket = var.artifact_bucket
   key    = "lambda-artifacts/${var.name}.zip"
   source = data.archive_file.this.output_path
-  etag   = data.archive_file.this.output_md5
+
+  source_hash = data.archive_file.this.output_md5
 }
 
 resource "aws_lambda_function" "this" {
