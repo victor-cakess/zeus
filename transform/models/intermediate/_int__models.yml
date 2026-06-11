@@ -84,3 +84,55 @@ models:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns: [ba, observation_date]
+
+  - name: int_fred__prices_daily
+    description: >
+      FRED price series on a daily calendar spine — one row per date, one column per
+      series (wide), LOCF-filled everywhere including the trailing publication lag
+      (M-10). Each <series> value column has two companions: <series>_is_observed
+      (boolean — true on a real observation date, false on a carry-forward) and
+      <series>_staleness_days (int — days since the last real observation; 0 when
+      observed, null before the series' first observation). Values are the LATEST
+      REVISION, not point-in-time — using them as ML training features is forward
+      leakage; as-of reconstruction is deferred (M-11). Leading-edge dates (before a
+      series first published) are null in the value and staleness columns.
+    columns:
+      - name: date
+        description: Calendar date (one row per day from the earliest observation to today).
+        data_tests: [not_null]
+      # 15 value columns, native units (M-9). Each has a matching _is_observed
+      # (boolean) and _staleness_days (int) companion — see the model description.
+      - name: wti
+        description: WTI crude spot, Cushing OK ($/bbl). LOCF; daily business-day series.
+      - name: brent
+        description: Brent crude spot, Europe ($/bbl). LOCF; daily business-day series.
+      - name: henryhub
+        description: Henry Hub natural gas spot ($/MMBtu). LOCF; daily business-day series.
+      - name: heatingoil
+        description: No. 2 heating oil spot, NY Harbor ($/gal). LOCF; daily business-day series.
+      - name: propanemt
+        description: Propane spot, Mont Belvieu TX ($/gal). LOCF; daily business-day series.
+      - name: jetfuel
+        description: Kerosene-type jet fuel spot, US Gulf Coast ($/gal). LOCF; daily business-day series.
+      - name: gasnyh
+        description: Conventional gasoline spot, NY Harbor ($/gal). LOCF; daily business-day series.
+      - name: gasgulf
+        description: Conventional gasoline spot, US Gulf Coast ($/gal). LOCF; daily business-day series.
+      - name: gasoline
+        description: US regular gasoline retail ($/gal). LOCF; weekly series (Monday), ≤~7-day staleness.
+      - name: diesel
+        description: US diesel retail ($/gal). LOCF; weekly series (Monday), ≤~7-day staleness.
+      - name: coalppi
+        description: PPI coal (index 1982=100). LOCF; monthly series, ≤~31-day staleness (up to ~120 mid-revision).
+      - name: natgasppi
+        description: PPI natural gas (index 1982=100). LOCF; monthly series, ≤~31-day staleness (up to ~120 mid-revision).
+      - name: elecppi
+        description: PPI electric power (index 1982=100). LOCF; monthly series, ≤~31-day staleness (up to ~120 mid-revision).
+      - name: elecprice
+        description: Avg US electricity price ($/kWh). LOCF; monthly series, ≤~31-day staleness.
+      - name: cpienergy
+        description: CPI energy (index 1982-84=100). LOCF; monthly series, ≤~31-day staleness.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [date]

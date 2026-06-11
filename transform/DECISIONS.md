@@ -273,3 +273,162 @@ fail-loudly-at-staging principle.)
 - Bounds wide enough for genuine extremes can't catch plausible-but-wrong values.
 - The specific bounds and the warn-column list live in the yml (the contract);
   this entry records only the policy.
+
+---
+
+## M-9. FRED staging: dedup keep-latest, per-group bounds before the LOCF carry
+
+**Chosen:** `stg_fred__prices` dedups landing on `(series, date)` keeping the latest
+`ingestion_date` (the same lookback-overlap rule as EIA/NOAA), passes values through
+in **native units**, and carries **per-group** physical-bounds output assertions in
+its `schema.yml`. The 15 series fall into bound groups by unit/scale: the monthly
+indexes (PPI coal/natgas/elec, CPI energy) and the always-positive price *levels*
+(ELECPRICE `$/kWh`, retail GASOLINE/DIESEL `$/gal`) get a `> 0` floor + a generous
+upper cap; the eight daily **spot** prices (WTI/BRENT `$/bbl`, HENRYHUB `$/MMBtu`,
+and the `$/gal` product spots) get an upper sanity cap **only** — no lower bound,
+because spot prices legitimately go negative (WTI −36.98 on 2020-04-20).
+
+**Alternatives considered:**
+- **A single blanket `value > 0`** — wrong: fails on the real negative WTI print.
+- **A uniform sanity cap, no floor anywhere** — wouldn't catch a negative index or
+  retail value, which is physically impossible and signals corruption.
+
+**Why:**
+- Bounds belong at staging (M-8 — surface bad values, don't clean them), and here
+  there's an extra reason to test *before* the intermediate: `int_fred` LOCF carries
+  a value forward across many days, so one garbage observation would propagate.
+  Catching it on the source row keeps the blast radius to one `(series, date)`.
+- Per-group because the series span four unit scales (`$/bbl`, `$/gal`, `$/MMBtu`,
+  index) with different plausible ranges — one bound can't fit all.
+
+**Trade-offs:**
+- Long staging holds every series in one `value` column, so the bounds tests scope
+  by series with a `where:` clause (≈6 grouped tests) rather than per-column ranges
+  like wide NOAA staging. The specific bounds live in the yml (the contract); this
+  entry records only the grouping policy.
+- Upper caps are wide enough for genuine spikes (Henry Hub hit 30.72 in Winter Storm
+  Uri) and so can't catch plausible-but-wrong mid-range values.
+
+**Open data-quality flag (BRENT min, 2026-06-11):** the 2014–2026 BRENT minimum is
+$9.12/bbl — below any known post-2014 Brent floor (the COVID low was ~$16). Because
+the `$/bbl` spot bound is **max-only** by this decision, the test does **not** catch
+it; LOCF carries it at most one day (daily series). Unresolved — real outlier vs bad
+FRED print is TBD. Check the observation date (`select date, value from
+ZEUS_DEV.FRED.FRED_GRID where series = 'BRENT' and value < 15 order by value`) before
+relying on BRENT for analysis. If it proves to be a bad print, the fix is upstream
+(the client/source), not a staging clean (M-8).
+
+---
+
+## M-10. Mixed frequency reshaped onto a daily LOCF spine, wide
+
+**Chosen:** `int_fred__prices_daily` reshapes the mixed-frequency series (8
+daily-business-day, 2 weekly, 5 monthly) onto a single **daily calendar spine** —
+one row per date, one column per series (**wide**). Each series is
+last-observation-carried-forward (**LOCF**) across the gaps its native frequency
+leaves: weekends/holidays for daily spots, the 6 intra-week days for weekly retail,
+the ~30 intra-month days for monthly indexes. Carry-forward applies **everywhere**,
+including the **trailing** publication-lag window (a series' latest value is held
+until its next release lands). The **leading** edge — dates before a series' first
+real observation — stays null (no value to carry). The spine runs from the earliest
+observation across all series to `current_date`.
+
+**Alternatives considered:**
+- **Keep the native sparse grain and let each consumer densify** — pushes the same
+  LOCF logic into every consumer, and a 7-day-a-week grid product would have no
+  price on weekends.
+- **Null the trailing lag window like NOAA weather (M-4)** — reintroduces a join-hole
+  on the freshest, most-queried rows and creates a third missingness state; rejected
+  because the staleness columns (M-11) already label carried-forward values, so
+  nulling adds only holes.
+- **Long format (series/date/value rows)** — compact, but every date-join needs a
+  pivot and you lose per-series column contracts; wide matches
+  `int_noaa__weather_daily` and makes the downstream join a plain equi-join on date.
+
+**Why:**
+- The grid and weather run every calendar day and join on date; a dense daily price
+  for every series is what those consumers need.
+- LOCF is the standard way to value a lower-frequency series on an off day — the last
+  published price *is* the prevailing price until the next print.
+- No staleness cap: capping would null mid-series and break the join the spine exists
+  to enable; instead staleness is a column (M-11) so consumers cap themselves.
+  Expected max staleness is bounded by frequency (≈3 days daily, ≈7 weekly, ≈31
+  monthly, up to ~120 for a monthly series mid-revision-lag) and documented per column.
+
+**Trade-offs:**
+- A carried-forward value looks identical to a fresh one in the `value` column alone —
+  the `is_observed`/`staleness` companions (M-11) are mandatory, not optional, to
+  recover that.
+- Wide means 15 series × 3 columns; a Jinja loop over the series list generates them
+  to keep the model DRY (diverging from NOAA's hand-listed columns, justified by the
+  45-column count). Values are latest-revision (M-11).
+
+---
+
+## M-11. Missingness as signal — `is_observed` + `staleness_days`; point-in-time deferred
+
+**Chosen:** alongside each ffilled value, `int_fred` carries `<series>_is_observed`
+(boolean — was this date a real observation or a carry-forward) and
+`<series>_staleness_days` (integer — days since the last real observation; 0 on an
+observed day, null before the first). One table serves BI (read the value) and ML
+(read value + how stale + whether real) without a second model. The values are the
+**latest revision** of each observation, **not** point-in-time as-of values;
+reconstructing as-of snapshots (what was known on date D) is **deferred** — the
+landing table's full `ingestion_date` revision history supports building it later when
+a forecasting use case needs leakage-free training features.
+
+**Alternatives considered:**
+- **`staleness_days` only** (`is_observed ≡ staleness == 0`, so derivable) — rejected
+  for consumer ergonomics; an explicit boolean reads cleaner as a filter/feature than
+  an equality check, and the redundancy is two cheap columns.
+- **A separate ML-feature table** — premature; the flags are cheap enough to live in
+  the one shared model.
+- **Build point-in-time now** — a large feature-store effort for no current consumer;
+  the revision history is preserved in landing, so the option stays open.
+
+**Why:**
+- Plain LOCF erases the difference between a fresh print and a month-old
+  carry-forward, and that difference is signal a model should see (and a caveat an
+  analyst should know). Exposing it as columns keeps a single source of truth.
+- The point-in-time deferral is *recorded* rather than silently ignored because
+  latest-revision values are forward-looking leakage for ML training (a 2020 PPI row
+  reflects a revision published months later) — a real correctness issue parked
+  deliberately, not missed.
+
+**Trade-offs:**
+- 30 companion columns on a 15-series table; `is_observed` is redundant with
+  `staleness_days` by construction.
+- Consumers training models on this table without the deferred as-of layer must
+  understand the leakage caveat (documented on the model).
+
+---
+
+## M-12. FRED mart standalone, full-rebuild table, not joined into `fct_energy_daily`
+
+**Chosen:** `fct_fuel_prices_daily` is a standalone **date-grain** mart (one row per
+date — the wide intermediate materialized as a plain **table**, full-rebuilt each
+run). It is **not** joined into `fct_energy_daily`: FRED is national (no `ba`), so
+embedding it would repeat every price across all 71 BAs. Consumers that want prices
+beside generation join the two marts on `date` themselves; an embedded view can come
+later if an analysis demands it.
+
+**Alternatives considered:**
+- **Incremental merge like `fct_generation_hourly` (M-5)** — buys nothing and is
+  actively wrong: BLS revises monthly PPI/CPI up to ~4 months back (rewriting old
+  rows) and the LOCF output shifts every day as the spine extends, so a bounded
+  incremental window can't capture the changes; the table is tiny (~4,500 date rows),
+  so a full rebuild is trivial.
+- **Join into `fct_energy_daily` now** — 71× row fan-out of identical national values,
+  for a cross-source join no consumer has asked for yet.
+
+**Why:**
+- M-5's rule — marts are the materialized consumption surface so consumers don't
+  recompute the view chain over landing. The daily-mart half of M-5 (plain table,
+  full rebuild) fits exactly; the incremental half was for the high-volume hourly
+  fact, which this is not.
+- Standalone keeps the grain honest (`date`, not `ba × date`) until a real
+  cross-source need defines how prices should attach.
+
+**Trade-offs:**
+- A price-vs-generation analysis writes its own join rather than reading one wide
+  table. Revisit the embed-vs-join-yourself call when such a consumer appears.

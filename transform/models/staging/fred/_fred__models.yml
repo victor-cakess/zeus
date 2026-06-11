@@ -1,0 +1,87 @@
+version: 2
+
+models:
+  - name: stg_fred__prices
+    description: >
+      FRED energy price series, deduplicated on the lookback/backfill overlap (keep
+      latest ingestion_date = latest BLS revision). One row per (series, date), values
+      in native units. Long shape — the daily LOCF reshape happens in
+      int_fred__prices_daily (M-10), not here. Per-group physical bounds below surface
+      bad values before the intermediate carries them forward (M-9).
+    columns:
+      - name: series
+        description: Unit slug — one of the 15 national price series. Grain + fan-out key.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - WTI
+                  - BRENT
+                  - HENRYHUB
+                  - HEATINGOIL
+                  - PROPANEMT
+                  - JETFUEL
+                  - GASNYH
+                  - GASGULF
+                  - GASOLINE
+                  - DIESEL
+                  - COALPPI
+                  - NATGASPPI
+                  - ELECPPI
+                  - ELECPRICE
+                  - CPIENERGY
+      - name: series_id
+        description: FRED series id (DCOILWTICO, WPU0571, …).
+        data_tests: [not_null]
+      - name: date
+        description: Observation date.
+        data_tests: [not_null]
+      - name: value
+        description: >
+          Observed value in native units — $/bbl (WTI, BRENT), $/MMBtu (HENRYHUB),
+          $/gal (HEATINGOIL, PROPANEMT, JETFUEL, GASNYH, GASGULF, GASOLINE, DIESEL),
+          $/kWh (ELECPRICE), or index points (COALPPI/NATGASPPI/ELECPPI 1982=100,
+          CPIENERGY 1982-84=100). Never null (the client drops FRED "." placeholders).
+        data_tests:
+          - not_null
+          # Per-group physical bounds (M-9). Floored groups: a negative is corruption.
+          # Spot groups: upper sanity cap only — spot prices legitimately go negative
+          # (WTI -36.98 on 2020-04-20), so no lower bound.
+          - dbt_utils.accepted_range:
+              name: fred_bounds_indexes
+              arguments: { min_value: 0, max_value: 1000, inclusive: true }
+              config:
+                where: "series in ('COALPPI', 'NATGASPPI', 'ELECPPI', 'CPIENERGY')"
+          - dbt_utils.accepted_range:
+              name: fred_bounds_elecprice
+              arguments: { min_value: 0, max_value: 5, inclusive: true }
+              config:
+                where: "series = 'ELECPRICE'"
+          - dbt_utils.accepted_range:
+              name: fred_bounds_retail_gal
+              arguments: { min_value: 0, max_value: 15, inclusive: true }
+              config:
+                where: "series in ('GASOLINE', 'DIESEL')"
+          - dbt_utils.accepted_range:
+              name: fred_bounds_spot_gal
+              arguments: { max_value: 20, inclusive: true }
+              config:
+                where: "series in ('HEATINGOIL', 'PROPANEMT', 'JETFUEL', 'GASNYH', 'GASGULF')"
+          - dbt_utils.accepted_range:
+              name: fred_bounds_spot_bbl
+              arguments: { max_value: 300, inclusive: true }
+              config:
+                where: "series in ('WTI', 'BRENT')"
+          - dbt_utils.accepted_range:
+              name: fred_bounds_spot_mmbtu
+              arguments: { max_value: 100, inclusive: true }
+              config:
+                where: "series = 'HENRYHUB'"
+      - name: ingestion_date
+        description: Date this row was ingested; used to pick the latest on dedup.
+    # Output assertion of the grain spec.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [series, date]
