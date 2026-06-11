@@ -25,22 +25,13 @@ resource "aws_ecr_lifecycle_policy" "dbt" {
   })
 }
 
-# Build + push the image whenever its fingerprint changes. Docker and the AWS CLI
-# must be on PATH at apply time (like uv/python3.12 for the zip builds).
-resource "null_resource" "build" {
-  triggers = {
-    image = local.image_hash
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      set -e
-      aws ecr get-login-password --region sa-east-1 | docker login --username AWS --password-stdin ${local.registry}
-      docker build --platform linux/amd64 -t ${aws_ecr_repository.dbt.repository_url}:${local.image_hash} -f ${local.dbt_src}/Dockerfile ${local.repo_root}
-      docker push ${aws_ecr_repository.dbt.repository_url}:${local.image_hash}
-    EOT
-  }
-}
+# NOTE: the image build/push moved out of Terraform into CI
+# (.github/workflows/dbt-deploy.yml) — that workflow owns the image, this root owns the
+# Lambda infra (see lifecycle.ignore_changes on aws_lambda_function.dbt below). The
+# image_uri here is bootstrap-only: it pins the tag at create time, then CI's
+# update-function-code takes over and Terraform ignores the drift. For a from-scratch
+# environment, push one image first (run dbt-deploy via workflow_dispatch, or a manual
+# docker build/push) so the tag exists before this Lambda is created.
 
 # Transformer private key (PKCS8 PEM), set out-of-band via `aws ssm put-parameter`.
 # The matching public key lives on the ZEUS_DEV_TRANSFORMER user. Manual local dbt
@@ -128,5 +119,9 @@ resource "aws_lambda_function" "dbt" {
     }
   }
 
-  depends_on = [null_resource.build]
+  # CI (.github/workflows/dbt-deploy.yml) owns the image via update-function-code;
+  # ignore its tag here so `terraform apply` never reverts a CI deploy.
+  lifecycle {
+    ignore_changes = [image_uri]
+  }
 }

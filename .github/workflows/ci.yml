@@ -57,6 +57,7 @@ jobs:
       matrix:
         root:
           - core
+          - cicd
           - pipelines/eia
           - pipelines/noaa
           - pipelines/digest

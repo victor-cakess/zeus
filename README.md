@@ -349,6 +349,28 @@ rows = [normalize_row(r, today)
 
 ---
 
+## 16. dbt image CD: deploy decoupled from Terraform, GitHub OIDC
+
+**Chosen:** The dbt runner image is built and deployed by a CD workflow (`.github/workflows/dbt-deploy.yml`) on push to `dev` touching `transform/**`, `src/lambdas/dbt/**`, or `src/shared/**` (plus `workflow_dispatch`), **not** by `terraform apply`. The workflow assumes a least-privilege role via **GitHub OIDC** (no long-lived AWS keys), `docker build`s with the same Dockerfile + repo-root context the old `local-exec` used, pushes to ECR tagged by commit SHA, runs `aws lambda update-function-code`, then **smoke-invokes** `zeus-dev-dbt-run` (`dbt build`) as the deploy gate — failing red on `status != ok` or any failed test. Ownership splits cleanly: Terraform provisions the Lambda/ECR (with `lifecycle.ignore_changes = [image_uri]`), CI owns the image. The OIDC provider + the `zeus-dev-dbt-deploy` role live in their own root (`infra/cicd/`), the role assumable only from `refs/heads/dev` of this repo and scoped to ECR-push on the dbt repo + `UpdateFunctionCode`/`InvokeFunction` on the one function; the role ARN is published to the GitHub Actions variable `AWS_DEPLOY_ROLE_ARN`.
+
+**Alternatives considered:**
+- **Run `terraform apply` in CI** — the honest "full CD" answer, but blocked by local Terraform state: an ephemeral runner has no state and would try to recreate everything. Fixing that means the S3-backend migration + locking, deliberately deferred as its own project (decision pending; see CLAUDE.md → CI Phase 3). Decoupling the image deploy sidesteps state entirely.
+- **Keep the `null_resource` local-exec build, just run it from CI** — still couples the deploy to a Terraform run (and its state); the build doesn't need Terraform at all — it's `docker build` + `push` + `update-function-code`.
+- **Long-lived AWS access keys in GitHub secrets** — simpler, but a standing credential to rotate/leak; OIDC issues short-lived creds per run and matches the "secrets never in code" posture (decisions 5–6).
+- **Let both Terraform and CI set the image** — they'd fight over `image_uri` on every apply; `ignore_changes` gives CI sole ownership.
+
+**Why:**
+- The manual `terraform apply` after every model change was the friction this removes; the PR's clone CI (decision 15) already validates the models, so merge-to-dev is a safe deploy trigger and the smoke-invoke is the final gate on the real image.
+- No remote state required, so it ships now instead of waiting on the state migration — and the OIDC provider it stands up is exactly what full Phase-3 CD will reuse.
+- The dbt project is baked into the image, so a local-only `dbt build` is reverted by the next cron; an automatic deploy is what makes "merge" mean "shipped."
+
+**Trade-offs:**
+- A from-scratch environment needs a bootstrap image pushed before the Lambda can be created (the tag must exist) — handled via `workflow_dispatch` or a one-off manual build.
+- Two systems now touch the Lambda (Terraform for config, CI for code); the `ignore_changes` boundary is load-bearing — dropping it would let an apply revert a deploy.
+- The pattern currently covers only the dbt image; the zip Lambdas (eia/noaa/fred/digest) still deploy via local `terraform apply`. Generalizing this decoupling to them is the natural next step.
+
+---
+
 # Pipeline-specific decisions
 
 ## EIA pipeline
@@ -633,7 +655,7 @@ Runs `dbt build` (staging + intermediate models and their tests) over `transform
 
 ### DBT-1. Runner: a container-image Lambda
 
-**Chosen:** One Lambda, `zeus-dev-dbt-run` (2048 MB / 300 s), deployed as a **container image**: `FROM public.ecr.aws/lambda/python:3.12`, `pip install dbt-snowflake`, `COPY transform/` + `src/shared/` + the handler, and `dbt deps` baked at build time so the runtime never hits the package hub. The image lives in an ECR repo (`zeus-dev-dbt-run`, lifecycle policy keeps the last 3 images), tagged with a content hash over the Dockerfile/runner `*.py`/`transform/`/`src/shared/` so any change forces a rebuild + push (the same fingerprint pattern as `lambda_job`'s zip builds; the docker build context is the repo root, allowlisted by `.dockerignore`). The Lambda resource is authored inline in `infra/pipelines/dbt/` — `lambda_job` stays zip-only (decision 10). The handler invokes dbt in-process via `dbtRunner` and authenticates as `ZEUS_DEV_TRANSFORMER` (key-pair; private key in SSM `/zeus/dev/snowflake/transformer_private_key`, fetched to `/tmp` per run — same secret contract as decisions 5–6).
+**Chosen:** One Lambda, `zeus-dev-dbt-run` (2048 MB / 300 s), deployed as a **container image**: `FROM public.ecr.aws/lambda/python:3.12`, `pip install dbt-snowflake`, `COPY transform/` + `src/shared/` + the handler, and `dbt deps` baked at build time so the runtime never hits the package hub. The image lives in an ECR repo (`zeus-dev-dbt-run`, lifecycle policy keeps the last 3 images), tagged with the commit SHA and **built + pushed by CI** (`.github/workflows/dbt-deploy.yml`, decision 16) on merge to dev — not by `terraform apply` (the docker build context is the repo root, allowlisted by `.dockerignore`). The Lambda resource is authored inline in `infra/pipelines/dbt/` — `lambda_job` stays zip-only (decision 10) — and **ignores `image_uri`** so Terraform owns the infra while CI owns the image. The handler invokes dbt in-process via `dbtRunner` and authenticates as `ZEUS_DEV_TRANSFORMER` (key-pair; private key in SSM `/zeus/dev/snowflake/transformer_private_key`, fetched to `/tmp` per run — same secret contract as decisions 5–6).
 
 **Alternatives considered:**
 - **Zip Lambda (decision 7's pattern).** `dbt-snowflake` + its dependency tree plus the dbt project files don't fit the zip limits comfortably, and dbt expects a real filesystem project layout — the image COPYs `transform/` in as-is.
@@ -646,8 +668,8 @@ Runs `dbt build` (staging + intermediate models and their tests) over `transform
 - Image cold-start (~3.8 s init) is irrelevant for a daily batch.
 
 **Trade-offs:**
-- Applies of the dbt root need `docker` + `aws` on PATH (ECR login + build + push), in addition to the zip builds' `uv`/`python3.12`.
-- Model/test changes in `transform/` mean an image rebuild + push (~seconds with a warm layer cache), not just a zip re-upload.
+- The image deploy is decoupled into CI (decision 16), so the Lambda's running code no longer changes on `terraform apply` — a from-scratch environment must push one image (via `workflow_dispatch` or a manual build) before this Lambda can be created.
+- Model/test changes in `transform/` mean an image rebuild + push, now automatic on merge to dev rather than a manual local build.
 
 ### DBT-2. Report-before-raise: the dbt run report feeds the digest
 

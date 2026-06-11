@@ -1,0 +1,88 @@
+# CD — build + deploy the dbt runner image on merge to dev.
+#
+# Replaces the manual `terraform apply infra/pipelines/dbt` (which used to build/push
+# the image via a local-exec). The deploy is decoupled from Terraform: this workflow
+# owns the image (build → push → update-function-code), Terraform owns the Lambda infra
+# (with lifecycle.ignore_changes = [image_uri], so it never fights this workflow).
+# Needs no Terraform state, so it works while state is still local — see CLAUDE.md
+# (Working norms → CI) for the deferred full-Terraform-CD path.
+#
+# Auth: GitHub OIDC → the zeus-dev-dbt-deploy role (infra/cicd), assumable only from
+# this branch. No long-lived AWS keys. The PR's dbt-clone-ci already validated the
+# models against a clone; the smoke-invoke here is the final gate on the real image.
+
+name: dbt-deploy
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "transform/**"
+      - "src/lambdas/dbt/**"
+      - "src/shared/**"
+  workflow_dispatch: {}
+
+# Serialize deploys; never cancel one mid-flight (a half-pushed image / update is worse
+# than waiting).
+concurrency:
+  group: dbt-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # assume the deploy role via OIDC
+  contents: read
+
+env:
+  AWS_REGION: sa-east-1
+  FUNCTION: zeus-dev-dbt-run
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume deploy role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Same Dockerfile + repo-root context as the retired local-exec build; tagged by
+      # commit SHA (immutable, traceable). The ECR lifecycle policy keeps only the last 3.
+      - name: Build + push image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.FUNCTION }}:${{ github.sha }}
+        run: |
+          docker build --platform linux/amd64 -t "$IMAGE" -f src/lambdas/dbt/Dockerfile .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Update function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "$FUNCTION" \
+            --image-uri "$IMAGE" >/dev/null
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION"
+
+      # Final gate: run dbt build from the just-deployed image. Fail the deploy if the
+      # handler errored or any dbt test failed.
+      - name: Smoke-invoke (dbt build)
+        run: |
+          aws lambda invoke \
+            --function-name "$FUNCTION" \
+            --payload '{}' --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 320 \
+            /tmp/dbt-out.json >/dev/null
+          echo "Lambda response:"; cat /tmp/dbt-out.json; echo
+          status=$(jq -r '.status' /tmp/dbt-out.json)
+          failed=$(jq -r '.tests_failed' /tmp/dbt-out.json)
+          if [ "$status" != "ok" ] || [ "$failed" != "0" ]; then
+            echo "::error::dbt build failed in the deployed image (status=$status, tests_failed=$failed)"
+            exit 1
+          fi
+          echo "Deploy verified: status=$status, tests_failed=$failed"
