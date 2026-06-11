@@ -1,0 +1,15 @@
+version: 2
+
+sources:
+  - name: fred
+    database: "{{ target.database }}"
+    schema: FRED
+    description: FRED national energy-price landing, loaded by the zeus-dev-fred-ingest Lambda's COPY INTO.
+    tables:
+      - name: fred_grid
+        description: >
+          Append-only FRED landing table. Narrow: one row per (series, date) — a single
+          observed value per price series per observation date. Duplicates from the 150-day
+          lookback overlap (and the backfill/daily overlap) are removed in stg_fred__prices
+          (keep latest ingestion_date). BLS PPI/CPI revisions arrive as new rows with a later
+          ingestion_date, so the full revision history is preserved here.

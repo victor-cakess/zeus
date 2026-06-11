@@ -122,3 +122,53 @@ models:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns: [ba, date]
+
+  - name: fct_fuel_prices_daily
+    description: >
+      The national energy-price mart — int_fred__prices_daily materialized as a plain
+      table (M-5/M-12). Grain: one row per date (national, no ba). 15 price series on a
+      daily LOCF spine, each with _is_observed (boolean) + _staleness_days (int)
+      companions (M-11). Standalone — join to fct_energy_daily on date for prices
+      beside generation (M-12). Values are latest-revision, not point-in-time: ML
+      training on them is forward leakage (M-11). Full rebuild each run — PPI/CPI
+      revisions rewrite old rows, so incremental buys nothing.
+    config:
+      materialized: table
+    columns:
+      - name: date
+        description: Calendar date (one row per day from the earliest observation to today).
+        data_tests: [not_null]
+      - name: wti
+        description: WTI crude spot, Cushing OK ($/bbl), LOCF-filled. + _is_observed / _staleness_days.
+      - name: brent
+        description: Brent crude spot ($/bbl), LOCF-filled. + _is_observed / _staleness_days.
+      - name: henryhub
+        description: Henry Hub natural gas spot ($/MMBtu), LOCF-filled. + _is_observed / _staleness_days.
+      - name: heatingoil
+        description: No. 2 heating oil spot, NY Harbor ($/gal), LOCF-filled. + _is_observed / _staleness_days.
+      - name: propanemt
+        description: Propane spot, Mont Belvieu TX ($/gal), LOCF-filled. + _is_observed / _staleness_days.
+      - name: jetfuel
+        description: Jet fuel spot, US Gulf Coast ($/gal), LOCF-filled. + _is_observed / _staleness_days.
+      - name: gasnyh
+        description: Gasoline spot, NY Harbor ($/gal), LOCF-filled. + _is_observed / _staleness_days.
+      - name: gasgulf
+        description: Gasoline spot, US Gulf Coast ($/gal), LOCF-filled. + _is_observed / _staleness_days.
+      - name: gasoline
+        description: US regular gasoline retail ($/gal), LOCF-filled (weekly). + _is_observed / _staleness_days.
+      - name: diesel
+        description: US diesel retail ($/gal), LOCF-filled (weekly). + _is_observed / _staleness_days.
+      - name: coalppi
+        description: PPI coal (index 1982=100), LOCF-filled (monthly). + _is_observed / _staleness_days.
+      - name: natgasppi
+        description: PPI natural gas (index 1982=100), LOCF-filled (monthly). + _is_observed / _staleness_days.
+      - name: elecppi
+        description: PPI electric power (index 1982=100), LOCF-filled (monthly). + _is_observed / _staleness_days.
+      - name: elecprice
+        description: Avg US electricity price ($/kWh), LOCF-filled (monthly). + _is_observed / _staleness_days.
+      - name: cpienergy
+        description: CPI energy (index 1982-84=100), LOCF-filled (monthly). + _is_observed / _staleness_days.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [date]
