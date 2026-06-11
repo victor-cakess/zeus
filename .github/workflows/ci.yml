@@ -62,6 +62,7 @@ jobs:
           - pipelines/noaa
           - pipelines/digest
           - pipelines/dbt
+          - pipelines/fred
           - pipelines/orchestration
     steps:
       - uses: actions/checkout@v4
