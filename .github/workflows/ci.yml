@@ -2,9 +2,11 @@
 # Mirrors the local pre-commit + done-means offline checks so a PR can't merge
 # with secrets, unparseable dbt, or invalid/unformatted Terraform.
 #
-# Later phases (deliberately not here yet — see the CI section in CLAUDE.md):
-#   Phase 2: dbt build on PRs against a zero-copy clone of ZEUS_DEV
-#            (needs a least-privilege CI Snowflake user + key in repo secrets).
+# Phase 2 (dbt build on PRs against a zero-copy clone of ZEUS_DEV) lives in its own
+# workflow, dbt-clone-ci.yml — separate file because it needs a transform/** paths
+# trigger and it's the only workflow holding Snowflake credentials.
+#
+# Still deferred (see the CI section in CLAUDE.md):
 #   Phase 3: terraform plan on PRs (blocked on migrating state to an S3 backend
 #            + AWS OIDC for the runner — local state today).
 
