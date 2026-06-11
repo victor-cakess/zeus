@@ -50,6 +50,11 @@ variable "noaa_loader_public_key" {
   description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_NOAA_LOADER service user. The matching private key is set out-of-band in SSM; nothing secret here."
 }
 
+variable "fred_loader_public_key" {
+  type        = string
+  description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_FRED_LOADER service user. The matching private key is set out-of-band in SSM; nothing secret here."
+}
+
 variable "transformer_public_key" {
   type        = string
   description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_TRANSFORMER service user (dbt). The matching private key stays local for dbt runs; nothing secret here."

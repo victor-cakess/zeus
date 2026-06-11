@@ -28,6 +28,11 @@ locals {
       function_arn = data.terraform_remote_state.noaa.outputs.ingest_function_arn
       units        = data.terraform_remote_state.noaa.outputs.balancing_authorities
     },
+    {
+      name         = "fred"
+      function_arn = data.terraform_remote_state.fred.outputs.ingest_function_arn
+      units        = data.terraform_remote_state.fred.outputs.series
+    },
   ]
 
   # Retry only AWS-transient invoke failures; a function error (crash, total outage)
