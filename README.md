@@ -593,6 +593,40 @@ Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-
 
 ---
 
+## FRED pipeline
+
+Pulls 15 national energy price series from the St. Louis Fed's FRED API (`fred/series/observations`): 8 daily spot prices (WTI, Brent, Henry Hub, heating oil, propane, jet fuel, NY Harbor + Gulf Coast gasoline), 2 weekly retail prices (gasoline, diesel), and 5 monthly indexes (coal/natural-gas/electric-power PPI, electricity price, CPI energy). Mirrors the EIA/NOAA pipeline shape; only the genuinely source-specific decisions are recorded here.
+
+### FRED-1. Fan-out unit = series; national grain `(series, date)`, no `ba` key
+
+**Chosen:** The fan-out unit is the **series** (one raw `<SLUG>.json` per series), with the slug → FRED series-id map in `client.py`'s `SERIES` (mirrors NOAA's `STATIONS`). Narrow schema, one row per `(series, date)`: `series, series_id, date, value, ingestion_date`, loaded into `ZEUS_DEV.FRED.FRED_GRID`. FRED's `.` placeholder observations (weekends, holidays, not-yet-published) are dropped in the client, so an empty window is a skip, not a failure.
+
+**Alternatives considered:**
+- **Wide format** (one column per series, one row per date). Breaks every time a series is added and forces every row to wait for the slowest-publishing series; long format adds series the same way NOAA adds stations — one dict entry.
+- **Keying on `ba`.** FRED prices are national (no BA dimension); inventing one would be false precision. The series join grid/weather data downstream on **date** instead.
+
+**Why:** long `(series, date)` is the natural shape for heterogeneous-frequency series, keeps the `{"units":[...]}` event contract and per-unit fault tolerance identical to EIA/NOAA, and onboarding another series is one `SERIES` entry + one `locals.tf` entry.
+
+### FRED-2. Daily run with a 150-day lookback (mixed frequencies + PPI revisions)
+
+**Chosen:** FRED runs as the third parallel branch of the daily state machine with `lookback_days = 150` (vs EIA/NOAA's 7).
+
+**Alternatives considered:**
+- **Monthly schedule** — rejected: 8 of 15 series tick every business day; a monthly run leaves spot prices up to a month stale and adds a second orchestration path.
+- **7–35-day lookback** — 7 reports the monthly series as "skipped" most runs (fake noise in the digest); 35 fixes that but misses BLS PPI revisions, which land up to ~4 months after first release.
+
+**Why:** each FRED series has its own native frequency; a daily run with a wide window picks up whatever published or got revised, and the dedup-downstream contract (same as EIA/NOAA) absorbs the overlap.
+
+**Trade-offs:** every run re-fetches ~900 observations and appends them to the landing table (~330K rows/year, a few MB compressed; S3 ~50 MB/year) — deliberate duplication, deduped in the future dbt staging layer on `(series, date)` keeping the latest `ingestion_date`.
+
+### FRED-3. Transformer read grants are part of source onboarding
+
+**Chosen:** Onboarding a source includes adding the `ZEUS_DEV_TRANSFORMER_ROLE` grant pair (USAGE on the schema + SELECT on the GRID table) in `infra/core/snowflake_transform.tf`, alongside the `snowflake_landing` module call.
+
+**Why:** the landing module creates the schema/table/loader but grants nothing to the transformer; without the pair, dbt (and any human using the transformer role) can't see the new schema. Discovered during FRED's smoke test — the loader wrote 881 rows that the transformer couldn't read.
+
+---
+
 ## dbt pipeline
 
 Runs `dbt build` (staging + intermediate models and their tests) over `transform/` against `ZEUS_DEV`, daily, as the `Dbt` step of the state machine (decision 14) — between the ingest Parallel and the digest.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Python 3.12+ project managed with `uv`. The repo is a data platform for energy data ingestion and modeling. One Step Functions state machine (`zeus-dev-daily-pipeline`) runs the whole daily flow: two ingestion pipelines in parallel land data in S3 and load it into Snowflake landing tables — **EIA** (hourly fuel-type → `ZEUS_DEV.EIA.EIA_GRID`) and **NOAA** (daily weather summaries → `ZEUS_DEV.NOAA.NOAA_GRID`) — then a container-image Lambda (`zeus-dev-dbt-run`) runs `dbt build` (models + tests) over `transform/`, then `zeus-dev-reports-digest` emails one combined run-report covering both sources plus the dbt run. The digest step **always runs**, even when an upstream step failed. The two sources are deliberately keyed on the same balancing-authority codes (`ba`) so weather joins to grid data downstream.
+Python 3.12+ project managed with `uv`. The repo is a data platform for energy data ingestion and modeling. One Step Functions state machine (`zeus-dev-daily-pipeline`) runs the whole daily flow: three ingestion pipelines in parallel land data in S3 and load it into Snowflake landing tables — **EIA** (hourly fuel-type → `ZEUS_DEV.EIA.EIA_GRID`), **NOAA** (daily weather summaries → `ZEUS_DEV.NOAA.NOAA_GRID`), and **FRED** (national energy price series → `ZEUS_DEV.FRED.FRED_GRID`) — then a container-image Lambda (`zeus-dev-dbt-run`) runs `dbt build` (models + tests) over `transform/`, then `zeus-dev-reports-digest` emails one combined run-report covering all sources plus the dbt run. The digest step **always runs**, even when an upstream step failed. EIA and NOAA are deliberately keyed on the same balancing-authority codes (`ba`) so weather joins to grid data downstream; FRED is national (no `ba`) and joins on date.
 
 ## Repository layout
 
@@ -17,7 +17,8 @@ infra/
     snowflake.tf                  # shared ZEUS_DEV database
     snowflake_eia.tf              # module "eia_landing"  — EIA storage integration + ZEUS_DEV.EIA DDL + loader
     snowflake_noaa.tf             # module "noaa_landing" — NOAA storage integration + ZEUS_DEV.NOAA DDL + loader
-    snowflake_transform.tf        # ZEUS_DEV_TRANSFORMER role + key-pair user (dbt: read landing, own modeled schemas)
+    snowflake_fred.tf             # module "fred_landing" — FRED storage integration + ZEUS_DEV.FRED DDL + loader
+    snowflake_transform.tf        # ZEUS_DEV_TRANSFORMER role + key-pair user (dbt: read landing, own modeled schemas) — per-source read grants live here too
     snowflake_ci.tf               # ZEUS_DEV_CI role + key-pair user (GitHub Actions dbt clone CI; inherits transformer)
   modules/
     lambda_job/                   # one Lambda + IAM role + ZIP-via-S3 packaging
@@ -25,6 +26,7 @@ infra/
   pipelines/
     eia/                          # EIA pipeline root: SSM (api key + snowflake key) + lambda_job; exports function_arn + balancing_authorities
     noaa/                         # NOAA pipeline root: SSM (snowflake key only — NCEI needs no api key) + lambda_job; same outputs
+    fred/                         # FRED pipeline root: SSM (api key + snowflake key) + lambda_job; exports function_arn + series
     digest/                       # digest pipeline root: lambda_job (reads all sources' run reports + the dbt report, emails one summary)
     dbt/                          # dbt pipeline root: ECR repo + docker build/push + container-image Lambda + transformer-key SSM
     orchestration/                # daily state machine root: SFN + EventBridge cron + IAM; consumes the other roots' outputs (apply LAST)
@@ -42,6 +44,7 @@ src/
   lambdas/
     eia/ingest/                   # EIA Lambda: handler.py (orchestration) + client.py (paginated HTTP) + schema.py (dash→underscore) + requirements.txt
     noaa/ingest/                  # NOAA Lambda: handler.py + client.py (NCEI daily-summaries, batched stations, no token) + schema.py (wide, 13 datatypes) + requirements.txt
+    fred/ingest/                  # FRED Lambda: handler.py + client.py (series/observations, SERIES map, drops "." placeholders) + schema.py (narrow, series/date/value) + requirements.txt
     digest/                       # digest Lambda: handler.py reads each source's run_report.json + the dbt report, sends one combined email (requirements.txt: boto3 only)
     dbt/                          # dbt runner Lambda (container image): Dockerfile (bakes transform/ + dbt deps) + handler.py (thin: key → patches → dbt build → report) + lambda_mp_patch.py (/dev/shm patches) + requirements.txt
 transform/                        # dbt project (staging + intermediate + marts models + tests; profiles.yml env-var driven, key-pair auth) — COPYed into the dbt image at build
@@ -58,7 +61,7 @@ README.md                         # project overview + architectural decisions
 ### Daily orchestration (production)
 
 - **One state machine runs everything:** `zeus-dev-daily-pipeline` (root `infra/pipelines/orchestration/`). EventBridge rule `zeus-dev-daily-pipeline` fires `cron(0 7 * * ? *)` (07:00 UTC = 04:00 sa-east-1) → `states:StartExecution` with input `{}` (the BA payloads are baked into the definition).
-- **Shape:** `Ingest` (Parallel: EIA + NOAA branches) → `Dbt` → `Digest` → `CheckFailures` (Choice) → `Success` / `NotifyFailure` → `Fail`. Each ingest branch **catches its own failure** and normalizes to `{source, failed}` Pass states, so the Parallel always completes; the Dbt step's Catch routes straight to the digest — **the digest always runs**. `CheckFailures` inspects `$.ingest[i].failed` / `$.dbtError` / `$.digestError`; on any failure it publishes the full execution state to `zeus-dev-alerts` and marks the execution **Failed** (red in the console / CloudWatch metrics).
+- **Shape:** `Ingest` (Parallel: EIA + NOAA + FRED branches) → `Dbt` → `Digest` → `CheckFailures` (Choice) → `Success` / `NotifyFailure` → `Fail`. Each ingest branch **catches its own failure** and normalizes to `{source, failed}` Pass states, so the Parallel always completes; the Dbt step's Catch routes straight to the digest — **the digest always runs**. `CheckFailures` inspects `$.ingest[i].failed` / `$.dbtError` / `$.digestError`; on any failure it publishes the full execution state to `zeus-dev-alerts` and marks the execution **Failed** (red in the console / CloudWatch metrics).
 - **Retries:** each `lambda:invoke` retries only the AWS-transient set (`Lambda.ServiceException`, `TooManyRequests`, `SdkClient`, `AWSLambda`; 2 attempts, backoff 2.0). Function errors (crashes, total outage) go straight to the branch Catch — retrying a code bug just doubles the run.
 - **Visibility:** CloudWatch logging `level = ALL` + execution data (log group `/aws/vendedlogs/states/zeus-dev-daily-pipeline`), X-Ray tracing enabled.
 - **Single source of truth:** one `ingest_sources` local (fed by the eia/noaa roots' outputs via `terraform_remote_state`) derives the ingest Branches, the `CheckFailures` `$.ingest[i]` rules, and the SFN role's invoke list — adding a source is one entry + its remote-state block, and branch order can't diverge from the failure checks. The dbt/digest ARNs come from their roots' outputs the same way; the orchestration root duplicates nothing and must be **applied last**.
@@ -92,6 +95,16 @@ README.md                         # project overview + architectural decisions
 - **Outputs:** `raw/noaa/.../<ba>.json`, `curated/noaa/.../noaa_grid.parquet`, `reports/noaa/.../run_report.json` — same partition scheme as EIA.
 - **Observed performance:** production daily runs 5–50 s, avg ~13.5 s (CloudWatch `Duration`, June 2026).
 
+### FRED daily ingestion (production)
+
+- **Trigger:** the daily state machine invokes `zeus-dev-fred-ingest` synchronously, in parallel with EIA and NOAA, with `{"units": [...]}` — the 15-series slug list exported by `infra/pipelines/fred/` (`series` output).
+- **Worker:** single Lambda (Python 3.12, 1024 MB, 300 s, deployed via S3). Same orchestration shape as EIA/NOAA via the shared `ingest.run_ingest`: fan out per-series fetch → one raw JSON per series → consolidate to one curated Parquet → `COPY INTO ZEUS_DEV.FRED.FRED_GRID` → write `run_report.json`.
+- **Units = 15 national price series** (slug → FRED series id in the `SERIES` map in `src/lambdas/fred/ingest/client.py`; `infra/pipelines/fred/locals.tf` mirrors the key set): 8 daily spots (`WTI, BRENT, HENRYHUB, HEATINGOIL, PROPANEMT, JETFUEL, GASNYH, GASGULF`), 2 weekly retail (`GASOLINE, DIESEL`), 5 monthly indexes (`COALPPI, NATGASPPI, ELECPPI, ELECPRICE, CPIENERGY`). No `ba` — FRED joins grid/weather data downstream on date.
+- **Grain / schema:** one row per `(series, date)`, narrow: `series, series_id, date, value, ingestion_date`. The client drops FRED's `"."` placeholder observations, so an empty window is a skip, not a failure.
+- **Lookback = 150 days** (`lookback_days` in `infra/pipelines/fred/variables.tf`, vs 7 for EIA/NOAA): keeps every frequency represented in every run and re-captures BLS PPI revisions (landing up to ~4 months after first release). ~900 rows/run appended; deduped downstream on `(series, date)` keep latest `ingestion_date`.
+- **Secrets:** FRED API key in SSM `/zeus/dev/fred/api_key`; Snowflake loader key in `/zeus/dev/snowflake/fred_loader_private_key`.
+- **Outputs:** `raw/fred/.../<SLUG>.json`, `curated/fred/.../fred_grid.parquet`, `reports/fred/.../run_report.json` — same partition scheme as EIA/NOAA.
+
 ### dbt build (production)
 
 - **Trigger:** the `Dbt` state, between the ingest Parallel and the digest. Invoked synchronously with `{}`.
@@ -103,18 +116,18 @@ README.md                         # project overview + architectural decisions
 ### Daily digest (production)
 
 - **Trigger:** the final state-machine step — runs **always**, even when an ingest or dbt step failed (their Catches route to it). Invoked synchronously with `{}` (`zeus-dev-reports-digest`, 256 MB, 60 s).
-- **What it does:** for each source in `SOURCES` (`eia,noaa`), reads today's `reports/<source>/.../run_report.json` from S3, computes a 30-day skip history, and publishes **one** combined email to `zeus-dev-alerts` (succeeded/skipped counts + Snowflake rows loaded per source). It also reads `reports/dbt/.../run_report.json` and renders it as its own section (subject chip like `dbt 6 models / 36 tests` or `dbt FAILED 2 tests`, body lists failed-test names) — dbt is **not** a fan-out source, so `SOURCES` stays `eia,noaa`. A source or dbt run that wrote no report (it crashed → the execution-level alert already fired) is surfaced as "no report", not a crash. Adding a future source = append it to `var.sources`. Reuses `src/shared/report.py` (`format_digest`, `format_dbt_section`).
+- **What it does:** for each source in `SOURCES` (`eia,noaa,fred`), reads today's `reports/<source>/.../run_report.json` from S3, computes a 30-day skip history, and publishes **one** combined email to `zeus-dev-alerts` (succeeded/skipped counts + Snowflake rows loaded per source). It also reads `reports/dbt/.../run_report.json` and renders it as its own section (subject chip like `dbt 6 models / 36 tests` or `dbt FAILED 2 tests`, body lists failed-test names) — dbt is **not** a fan-out source, so `SOURCES` stays `eia,noaa,fred`. A source or dbt run that wrote no report (it crashed → the execution-level alert already fired) is surfaced as "no report", not a crash. Adding a future source = append it to `var.sources`. Reuses `src/shared/report.py` (`format_digest`, `format_dbt_section`). **SNS caps subjects at 100 ASCII chars** — `format_digest` uses compact per-source chips (`EIA 71/0`) and truncates at 100 as a guard (the long-form chips overflowed at 3 sources).
 
 ### Snowflake (live)
 
 - **Shared:** warehouse `ZEUS_DEV_WH` (x-small, auto-suspend 60 s, auto-resume) in `infra/core/main.tf`; database `ZEUS_DEV` in `infra/core/snowflake.tf`.
-- **Per-source landing stacks** are one `module "snowflake_landing"` call each (`snowflake_eia.tf`, `snowflake_noaa.tf`). The module derives every name from `source_name` and takes the table columns as a variable. Each call creates: a storage integration (`ZEUS_DEV_<SOURCE>_S3_INT`) + paired AWS IAM role (`zeus-dev-snowflake-<source>`), the schema + `<SOURCE>_GRID` table + `<SOURCE>_STAGE` over `curated/<source>/`, and a least-privilege key-pair loader (`ZEUS_DEV_<SOURCE>_LOADER`, USAGE + INSERT only).
-  - **EIA:** `ZEUS_DEV.EIA.EIA_GRID`, stage `EIA_STAGE`. **NOAA:** `ZEUS_DEV.NOAA.NOAA_GRID`, stage `NOAA_STAGE`.
+- **Per-source landing stacks** are one `module "snowflake_landing"` call each (`snowflake_eia.tf`, `snowflake_noaa.tf`, `snowflake_fred.tf`). The module derives every name from `source_name` and takes the table columns as a variable. Each call creates: a storage integration (`ZEUS_DEV_<SOURCE>_S3_INT`) + paired AWS IAM role (`zeus-dev-snowflake-<source>`), the schema + `<SOURCE>_GRID` table + `<SOURCE>_STAGE` over `curated/<source>/`, and a least-privilege key-pair loader (`ZEUS_DEV_<SOURCE>_LOADER`, USAGE + INSERT only). **The module grants nothing to the transformer** — onboarding a source also means adding its USAGE+SELECT grant pair in `snowflake_transform.tf`, or dbt can't read the new schema.
+  - **EIA:** `ZEUS_DEV.EIA.EIA_GRID`, stage `EIA_STAGE`. **NOAA:** `ZEUS_DEV.NOAA.NOAA_GRID`, stage `NOAA_STAGE`. **FRED:** `ZEUS_DEV.FRED.FRED_GRID`, stage `FRED_STAGE`.
 - **Load path:** the ingest Lambda's `COPY INTO ... FILE_FORMAT = (TYPE = PARQUET USE_LOGICAL_TYPE = TRUE) MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`. **`USE_LOGICAL_TYPE = TRUE` is required** — without it EIA's `period` loads as a raw INT64 and NOAA's `date` as a raw INT32 ("Invalid date").
 - **Auth:** public key in Terraform (`var.eia_loader_public_key` / `var.noaa_loader_public_key`), private key in SSM. Creating integrations + service users requires the `infra/core/` Snowflake provider to run as `ACCOUNTADMIN`.
 - **Transformer (dbt):** account role `ZEUS_DEV_TRANSFORMER_ROLE` + key-pair service user `ZEUS_DEV_TRANSFORMER` (`infra/core/snowflake_transform.tf`) — read-only on the landing schemas, `CREATE SCHEMA` on `ZEUS_DEV`, owns the modeled schemas; rolled up to SYSADMIN. Same key contract as the loaders: public key in tfvars (`var.transformer_public_key`), private key in SSM (`/zeus/dev/snowflake/transformer_private_key`) for the dbt Lambda; manual local dbt runs keep using the gitignored `sf_transformer.p8`.
 - **CI clone runner:** account role `ZEUS_DEV_CI_ROLE` + key-pair service user `ZEUS_DEV_CI` (`infra/core/snowflake_ci.tf`) — `CREATE DATABASE` on the account, USAGE on `ZEUS_DEV` + the warehouse, **plus the transformer role granted into it** (cloned child objects keep source grants/ownership, so only transformer privileges work inside a clone). Public key in tfvars (`var.ci_public_key`); private key in GitHub Actions secrets (`SNOWFLAKE_CI_PRIVATE_KEY`), local copy `sf_ci.p8` (gitignored). Used only by `.github/workflows/dbt-clone-ci.yml`.
-- **Table contract:** append-only landing; duplication from the lookback overlap is deduped downstream in dbt (EIA on `(period, respondent, fueltype)`, NOAA on `(date, station)`) keeping the latest `ingestion_date`. Per-file load metadata makes same-day re-runs idempotent.
+- **Table contract:** append-only landing; duplication from the lookback overlap is deduped downstream in dbt (EIA on `(period, respondent, fueltype)`, NOAA on `(date, station)`, FRED on `(series, date)`) keeping the latest `ingestion_date`. Per-file load metadata makes same-day re-runs idempotent.
 - **Module note:** EIA's landing resources were originally inline in `snowflake_eia.tf`; they were moved into the module via `terraform state mv` (no destroy/recreate — the module reproduces every name/comment exactly). See README cross-cutting decision for the move list.
 
 ## Commands
@@ -128,7 +141,7 @@ uv run pre-commit run --all-files
 # Terraform — core (S3 + SNS + Snowflake warehouse/db + per-source landing stacks); apply this first.
 # Requires in terraform.tfvars (gitignored): role = "ACCOUNTADMIN" (to create the
 # storage integrations + service users) and one loader RSA public-key body per source
-# (eia_loader_public_key, noaa_loader_public_key). Generate each key-pair once, e.g.:
+# (eia_loader_public_key, noaa_loader_public_key, fred_loader_public_key). Generate each key-pair once, e.g.:
 #   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out sf_noaa_loader.p8 -nocrypt
 #   openssl rsa -in sf_noaa_loader.p8 -pubout -out sf_noaa_loader.pub   # paste body into tfvars
 # (*.p8 and *.pub are gitignored.) Same pattern for the transformer (sf_transformer.p8 →
@@ -197,6 +210,18 @@ aws lambda invoke --function-name zeus-dev-noaa-ingest \
   --payload '{"units":["CISO","PJM"]}' --cli-binary-format raw-in-base64-out \
   /tmp/noaa-out.json && cat /tmp/noaa-out.json
 #   then: SELECT min(date), max(date), count(*) FROM ZEUS_DEV.NOAA.NOAA_GRID;
+
+# Terraform — FRED pipeline (same shape as EIA: api key + loader key)
+cd infra/pipelines/fred
+terraform init && terraform apply
+aws ssm put-parameter --name /zeus/dev/snowflake/fred_loader_private_key \
+  --value "$(cat sf_fred_loader.p8)" --type SecureString --overwrite
+aws ssm put-parameter --name /zeus/dev/fred/api_key \
+  --value "$FRED_API_KEY" --type SecureString --overwrite
+aws lambda invoke --function-name zeus-dev-fred-ingest \
+  --payload '{"units":["WTI","COALPPI"]}' --cli-binary-format raw-in-base64-out \
+  /tmp/fred-out.json && cat /tmp/fred-out.json
+#   then: SELECT min(date), max(date), count(*) FROM ZEUS_DEV.FRED.FRED_GRID;
 
 # Terraform — digest pipeline (one combined daily email across all sources)
 cd infra/pipelines/digest

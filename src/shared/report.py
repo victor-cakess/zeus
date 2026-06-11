@@ -142,7 +142,9 @@ def format_digest(
             continue
         n_ok = len(run_report["succeeded"])
         n_skip = len(run_report["skipped"])
-        summary.append(f"{label} {n_ok} ok / {n_skip} skipped")
+        # Compact succeeded/skipped chip — the body carries the labelled counts.
+        # SNS caps subjects at 100 chars; the long form overflowed at 3 sources.
+        summary.append(f"{label} {n_ok}/{n_skip}")
         _, body = format_email(run_report, history, source, history_days)
         bodies.append(body)
 
@@ -151,4 +153,6 @@ def format_digest(
     bodies.append(dbt_body)
 
     subject = f"Zeus daily {date_str} — " + " | ".join(summary)
+    if len(subject) > 100:
+        subject = subject[:97] + "..."
     return subject, "\n\n".join(bodies)

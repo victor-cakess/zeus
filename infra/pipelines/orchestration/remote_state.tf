@@ -19,6 +19,13 @@ data "terraform_remote_state" "noaa" {
   }
 }
 
+data "terraform_remote_state" "fred" {
+  backend = "local"
+  config = {
+    path = "${path.module}/../fred/terraform.tfstate"
+  }
+}
+
 data "terraform_remote_state" "digest" {
   backend = "local"
   config = {
