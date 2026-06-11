@@ -90,19 +90,12 @@ def build_dbt_report(d: date, res) -> dict:
     }
 
 
-def format_dbt_section(dbt_report: dict | None) -> tuple[str, str]:
-    """Subject chip + body block for the daily dbt run. dbt isn't a fan-out source
-    (no succeeded/skipped units), so it gets its own section, not a source section.
+def format_dbt_section(dbt_report: dict | None) -> str:
+    """Body block for the daily dbt run. dbt isn't a fan-out source (no
+    succeeded/skipped units), so it gets its own section, not a source section.
     A None report means dbt crashed before writing one (see failure alert)."""
     if dbt_report is None:
-        return "dbt no report", "DBT: no run report (it crashed before writing one — see failure alert)."
-
-    if dbt_report["status"] == "ok":
-        chip = f"dbt {dbt_report['models_built']} models / {dbt_report['tests_passed']} tests"
-    elif dbt_report["tests_failed"]:
-        chip = f"dbt FAILED {dbt_report['tests_failed']} tests"
-    else:
-        chip = "dbt FAILED"
+        return "DBT: no run report (it crashed before writing one — see failure alert)."
 
     lines = [
         f"DBT build — {dbt_report['date']}",
@@ -119,7 +112,7 @@ def format_dbt_section(dbt_report: dict | None) -> tuple[str, str]:
         lines.append("")
         lines.append(f"Error: {dbt_report['error']}")
 
-    return chip, "\n".join(lines)
+    return "\n".join(lines)
 
 
 def format_digest(
@@ -132,27 +125,18 @@ def format_digest(
     own on-failure alert already fired); it's surfaced here, not hidden.
     `dbt_report` is the dbt run's report, rendered as its own section.
     """
-    summary = []
     bodies = []
     for source, run_report, history in sections:
         label = source.upper()
         if run_report is None:
-            summary.append(f"{label} no report")
             bodies.append(f"{label}: no run report for {date_str} (see failure alert).")
             continue
-        n_ok = len(run_report["succeeded"])
-        n_skip = len(run_report["skipped"])
-        # Compact succeeded/skipped chip — the body carries the labelled counts.
-        # SNS caps subjects at 100 chars; the long form overflowed at 3 sources.
-        summary.append(f"{label} {n_ok}/{n_skip}")
         _, body = format_email(run_report, history, source, history_days)
         bodies.append(body)
 
-    dbt_chip, dbt_body = format_dbt_section(dbt_report)
-    summary.append(dbt_chip)
-    bodies.append(dbt_body)
+    bodies.append(format_dbt_section(dbt_report))
 
-    subject = f"Zeus daily {date_str} — " + " | ".join(summary)
-    if len(subject) > 100:
-        subject = subject[:97] + "..."
+    # Static subject: SNS caps subjects at 100 ASCII chars, so per-source detail
+    # lives in the body, not the title.
+    subject = f"Zeus daily report — {date_str}"
     return subject, "\n\n".join(bodies)
