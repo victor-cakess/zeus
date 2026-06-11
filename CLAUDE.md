@@ -53,6 +53,7 @@ extraction/                       # gitignored, exploratory notebooks
 backfill/                         # one-off historical backfill scripts (reuse src/ via _bootstrap.py); see backfill/README.md
   eia/                            # fetch→raw→curated→COPY: run.py (extract/transform) + fetch.py + extract.py + transform.py + snowflake_load.py + units.py (BA list) + _bootstrap.py + logconf.py
   noaa/                           # same two-phase pattern (run.py/fetch/extract/transform/snowflake_load + _bootstrap + logconf; stations from src client, no units.py); day-partitioned, backdated, idempotent resume
+  fred/                           # same two-phase pattern (series from src client's SERIES map); one request per series for the whole range, FRED_API_KEY env for extract; backfilled 2014→2026
 README.md                         # project overview + architectural decisions
 ```
 
@@ -265,6 +266,10 @@ uv run python backfill/noaa/run.py extract   --start 2010-01-01       # one batc
 uv run python backfill/noaa/run.py transform --start 2010-01-01       # per-day curated Parquet (S3-only, parallel)
 SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
   uv run python backfill/noaa/snowflake_load.py                       # whole-stage COPY into NOAA_GRID
+FRED_API_KEY=$(aws ssm get-parameter --name /zeus/dev/fred/api_key --with-decryption \
+  --query Parameter.Value --output text) \
+  uv run python backfill/fred/run.py extract --start 2014-01-01       # one request per series (whole range)
+uv run python backfill/fred/run.py transform --start 2014-01-01      # then snowflake_load.py (same env contract, sf_fred_loader.p8)
 ```
 
 ## Pre-commit hooks
