@@ -37,6 +37,4 @@ locals {
     [for f in sort(fileset("${local.repo_root}/src/shared", "**/*.py")) : filesha1("${local.repo_root}/src/shared/${f}")],
     [for f in sort(fileset(local.dbt_src, "*.py")) : filesha1("${local.dbt_src}/${f}")],
   )))
-
-  registry = split("/", aws_ecr_repository.dbt.repository_url)[0]
 }
