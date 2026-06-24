@@ -57,7 +57,7 @@ How code ships (distinct from the runtime view above). Two packaging paths: the 
 
 ### Data model
 
-Lineage + join keys for the dbt layer. EIA and NOAA are deliberately keyed on the same balancing-authority code (`ba`) so weather joins to generation on `(ba, date)` (M-4); FRED is national (no `ba`) and joins on `date` only (M-12). Grains are the `PK` columns. (For the full model-by-model lineage with column docs, run `dbt docs serve` in `transform/`.)
+Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). EIA and NOAA are deliberately keyed on the same balancing-authority code (`ba`) so weather joins to generation on `(ba, date)` (M-4); FRED is national (no `ba`) and joins on `date` only (M-12). Grains are the `PK` columns.
 
 ```mermaid
 erDiagram
@@ -81,30 +81,49 @@ erDiagram
         float value
         date ingestion_date
     }
+    INT_EIA__GENERATION_HOURLY {
+        string ba PK
+        timestamp period PK
+        float total_gross_mwh
+        float renewable_gross_mwh
+        float renewable_share "0..1 (M-1)"
+    }
+    INT_NOAA__WEATHER_DAILY {
+        string ba PK "join key"
+        date observation_date PK "join key"
+        int station_count
+        float weather_cols "13 BA-mean cols (M-3)"
+    }
+    INT_FRED__PRICES_DAILY {
+        date date PK
+        float price_series "15 series + _is_observed / _staleness_days (M-11)"
+    }
     FCT_GENERATION_HOURLY {
         string ba PK
         timestamp period PK
         float total_net_mwh
         float total_gross_mwh
-        float renewable_share "0..1 (M-1)"
+        float renewable_share
     }
     FCT_ENERGY_DAILY {
-        string ba PK "join key to weather"
-        date date PK "join key to weather / prices"
-        float total_net_mwh
+        string ba PK "join key"
+        date date PK "join key"
         float renewable_share
         int hours_reported "24 = complete"
         float weather_cols "13 BA-mean cols (nullable, M-4)"
     }
     FCT_FUEL_PRICES_DAILY {
         date date PK
-        float price_series "15 series + _is_observed / _staleness_days (M-11)"
+        float price_series "15 series + companions"
     }
 
-    EIA_GRID }o--|| FCT_GENERATION_HOURLY : "dedup + aggregate (M-1/M-2)"
+    EIA_GRID }o--|| INT_EIA__GENERATION_HOURLY : "stg dedup + rules (M-1/M-2)"
+    NOAA_GRID }o--|| INT_NOAA__WEATHER_DAILY : "station -> BA mean, daily (M-3)"
+    FRED_GRID }o--|| INT_FRED__PRICES_DAILY : "wide daily LOCF spine (M-10)"
+    INT_EIA__GENERATION_HOURLY ||--|| FCT_GENERATION_HOURLY : "materialize incremental (M-5)"
     FCT_GENERATION_HOURLY }o--|| FCT_ENERGY_DAILY : "roll up 24h -> 1 day"
-    NOAA_GRID }o--o| FCT_ENERGY_DAILY : "LEFT JOIN on (ba, date) (M-4)"
-    FRED_GRID }o--|| FCT_FUEL_PRICES_DAILY : "daily LOCF spine (M-10)"
+    INT_NOAA__WEATHER_DAILY }o--o| FCT_ENERGY_DAILY : "LEFT JOIN on (ba, date) (M-4)"
+    INT_FRED__PRICES_DAILY ||--|| FCT_FUEL_PRICES_DAILY : "materialize as table"
     FCT_ENERGY_DAILY }o--|| FCT_FUEL_PRICES_DAILY : "join on date (M-12, standalone)"
 ```
 
