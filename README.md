@@ -10,6 +10,13 @@ This file covers **platform/infra** decisions. Modeling and business-rule decisi
 
 ## Architecture
 
+![Zeus daily pipeline architecture](docs/architecture.png)
+
+<sub>Diagram-as-code — regenerate with `uv run --with diagrams --no-project python docs/architecture.py` (source: [`docs/architecture.py`](docs/architecture.py)). The inline Mermaid version below renders directly on GitHub and is the one to edit for quick changes.</sub>
+
+<details>
+<summary>Mermaid version (inline)</summary>
+
 ```mermaid
 flowchart TB
     cron["EventBridge cron<br/>(07:00 UTC daily)"] --> sfn
@@ -37,6 +44,8 @@ flowchart TB
     digest -->|combined run-report| email["Email via SNS"]
     check -->|failure| alert["SNS alert<br/>+ mark execution Failed"]
 ```
+
+</details>
 
 ---
 
