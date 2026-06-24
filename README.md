@@ -8,6 +8,36 @@ Format per entry: the decision, alternatives considered, why the chosen option w
 
 This file covers **platform/infra** decisions. Modeling and business-rule decisions for the dbt layer (grain, metric definitions, join semantics) live in [`transform/DECISIONS.md`](transform/DECISIONS.md), numbered `M-N` in the same format.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    cron["EventBridge cron<br/>(07:00 UTC daily)"] --> sfn
+
+    subgraph sfn["Step Functions — zeus-dev-daily-pipeline"]
+        direction TB
+        subgraph ingest["Ingest (parallel)"]
+            direction LR
+            eia["EIA Lambda<br/>hourly fuel-type"]
+            noaa["NOAA Lambda<br/>daily weather"]
+            fred["FRED Lambda<br/>energy prices"]
+        end
+        ingest --> dbt["dbt Lambda<br/>(container image)<br/>build + test"]
+        dbt --> digest["Digest Lambda<br/>(always runs)"]
+        digest --> check{"Any step<br/>failed?"}
+    end
+
+    eia -->|raw JSON + curated Parquet| s3[("S3<br/>raw/ · curated/ · reports/")]
+    noaa --> s3
+    fred --> s3
+    s3 -->|COPY INTO| sf[("Snowflake landing<br/>EIA_GRID · NOAA_GRID · FRED_GRID")]
+    sf -->|read| dbt
+    dbt -->|staging → intermediate → marts| marts[("Snowflake marts<br/>fct_* tables")]
+
+    digest -->|combined run-report| email["Email via SNS"]
+    check -->|failure| alert["SNS alert<br/>+ mark execution Failed"]
+```
+
 ---
 
 # Cross-cutting decisions
