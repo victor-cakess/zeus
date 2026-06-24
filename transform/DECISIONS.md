@@ -1,7 +1,7 @@
 # Modeling decisions (dbt layer)
 
 Business-rule and modeling decision records for the `transform/` dbt project — the
-domain-logic counterpart to the infra ADRs in the repo-root `README.md`.
+domain-logic counterpart to the infra ADRs in the repo-root `ADR.md`.
 
 **Division of labor:** this file records *decisions* (the choice, the rejected
 alternatives, the why); the enforceable *contract* lives as close to the code as
