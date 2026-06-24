@@ -47,6 +47,67 @@ flowchart TB
 
 </details>
 
+### Build & deploy
+
+How code ships (distinct from the runtime view above). Two packaging paths: the ingest/digest Lambdas build locally as zips uploaded to S3; the dbt Lambda ships as a container image via GitHub Actions CD (OIDC — no long-lived keys), gated by a smoke-invoke.
+
+![Zeus build & deploy](docs/deploy.png)
+
+<sub>Diagram-as-code — regenerate with `uv run --with diagrams --no-project python docs/deploy.py` (source: [`docs/deploy.py`](docs/deploy.py)).</sub>
+
+### Data model
+
+Lineage + join keys for the dbt layer. EIA and NOAA are deliberately keyed on the same balancing-authority code (`ba`) so weather joins to generation on `(ba, date)` (M-4); FRED is national (no `ba`) and joins on `date` only (M-12). Grains are the `PK` columns. (For the full model-by-model lineage with column docs, run `dbt docs serve` in `transform/`.)
+
+```mermaid
+erDiagram
+    EIA_GRID {
+        timestamp period "hour, UTC"
+        string respondent "balancing authority"
+        string fueltype
+        float value "MWh"
+        date ingestion_date
+    }
+    NOAA_GRID {
+        string ba
+        string station
+        date date
+        float datatypes "13 weather datatypes"
+        date ingestion_date
+    }
+    FRED_GRID {
+        string series
+        date date
+        float value
+        date ingestion_date
+    }
+    FCT_GENERATION_HOURLY {
+        string ba PK
+        timestamp period PK
+        float total_net_mwh
+        float total_gross_mwh
+        float renewable_share "0..1 (M-1)"
+    }
+    FCT_ENERGY_DAILY {
+        string ba PK "join key to weather"
+        date date PK "join key to weather / prices"
+        float total_net_mwh
+        float renewable_share
+        int hours_reported "24 = complete"
+        float weather_cols "13 BA-mean cols (nullable, M-4)"
+    }
+    FCT_FUEL_PRICES_DAILY {
+        date date PK
+        float price_series "15 series + _is_observed / _staleness_days (M-11)"
+    }
+
+    EIA_GRID }o--|| FCT_GENERATION_HOURLY : "dedup + aggregate (M-1/M-2)"
+    FCT_GENERATION_HOURLY }o--|| FCT_ENERGY_DAILY : "roll up 24h -> 1 day"
+    NOAA_GRID }o--o| FCT_ENERGY_DAILY : "LEFT JOIN on (ba, date) (M-4)"
+    FRED_GRID }o--|| FCT_FUEL_PRICES_DAILY : "daily LOCF spine (M-10)"
+    FCT_ENERGY_DAILY }o--|| FCT_FUEL_PRICES_DAILY : "join on date (M-12, standalone)"
+```
+
 ---
 
 # Cross-cutting decisions
