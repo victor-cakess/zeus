@@ -2,7 +2,7 @@
 
 A serverless **energy-data platform** on AWS + Snowflake. One Step Functions state machine runs the whole daily flow: three ingestion pipelines — **EIA** (hourly fuel-type generation), **NOAA** (daily weather summaries), and **FRED** (national energy prices) — run in parallel, each landing raw JSON + a curated Parquet in S3 and `COPY`ing it into a Snowflake landing table; a **dbt** container-image Lambda then builds and tests the modeled layers (staging → intermediate → marts); finally a **digest** Lambda emails one combined run-report across all sources plus the dbt run. The digest always runs, even when an upstream step fails.
 
-EIA and NOAA are deliberately keyed on the same balancing-authority codes (`ba`) so weather joins to generation downstream; FRED is national and joins on `date`.
+EIA and NOAA are deliberately keyed on the same balancing-authority codes (`ba`) so weather joins to generation in the marts; FRED prices are national and land as a standalone mart (a consumer can join them on `date`).
 
 > **Where things live:** architecture decisions → [ADR.md](ADR.md) · modeling decisions → [transform/DECISIONS.md](transform/DECISIONS.md) · operational commands & per-pipeline detail → [RUNBOOK.md](RUNBOOK.md) · conventions for *changing* the platform → [CLAUDE.md](CLAUDE.md).
 
@@ -55,7 +55,7 @@ How code ships (distinct from the runtime view above). dbt/transform PRs are fir
 
 ### Data model
 
-Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). EIA and NOAA are deliberately keyed on the same balancing-authority code (`ba`) so weather joins to generation on `(ba, date)` (M-4); FRED is national (no `ba`) and joins on `date` only (M-12). Grains are the `PK` columns.
+Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). The only cross-source join in the pipeline is EIA generation ↔ NOAA weather inside `fct_energy_daily`, on `(ba, date)` (M-4) — EIA and NOAA are deliberately keyed on the same balancing-authority code so this join works. `fct_fuel_prices_daily` (FRED) is **standalone** — national (no `ba`), not joined to the other marts; a consumer *can* join it to `fct_energy_daily` on `date`, but the pipeline doesn't (M-12). Grains are the `PK` columns.
 
 ```mermaid
 erDiagram
@@ -121,8 +121,7 @@ erDiagram
     INT_EIA__GENERATION_HOURLY ||--|| FCT_GENERATION_HOURLY : "materialize incremental (M-5)"
     FCT_GENERATION_HOURLY }o--|| FCT_ENERGY_DAILY : "roll up 24h -> 1 day"
     INT_NOAA__WEATHER_DAILY }o--o| FCT_ENERGY_DAILY : "LEFT JOIN on (ba, date) (M-4)"
-    INT_FRED__PRICES_DAILY ||--|| FCT_FUEL_PRICES_DAILY : "materialize as table"
-    FCT_ENERGY_DAILY }o--|| FCT_FUEL_PRICES_DAILY : "join on date (M-12, standalone)"
+    INT_FRED__PRICES_DAILY ||--|| FCT_FUEL_PRICES_DAILY : "materialize as table (standalone, M-12)"
 ```
 
 ## Tech stack
