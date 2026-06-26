@@ -52,13 +52,14 @@ src/
     digest/                       # digest Lambda: handler.py reads each source's run_report.json + the dbt report, sends one combined email (requirements.txt: boto3 only)
     dbt/                          # dbt runner Lambda (container image): Dockerfile (bakes transform/ + dbt deps) + handler.py (thin: key → patches → dbt build → report) + lambda_mp_patch.py (/dev/shm patches) + requirements.txt
 transform/                        # dbt project (staging + intermediate + marts models + tests; profiles.yml env-var driven, key-pair auth) — COPYed into the dbt image at build
-  DECISIONS.md                    # modeling/business-rule decision records (M-N entries; infra ADRs stay in README.md)
+  DECISIONS.md                    # modeling/business-rule decision records (M-N entries; infra ADRs live in repo-root ADR.md)
 extraction/                       # gitignored, exploratory notebooks
 backfill/                         # one-off historical backfill scripts (reuse src/ via _bootstrap.py); see backfill/README.md
   eia/                            # fetch→raw→curated→COPY: run.py (extract/transform) + fetch.py + extract.py + transform.py + snowflake_load.py + units.py (BA list) + _bootstrap.py + logconf.py
   noaa/                           # same two-phase pattern (run.py/fetch/extract/transform/snowflake_load + _bootstrap + logconf; stations from src client, no units.py); day-partitioned, backdated, idempotent resume
   fred/                           # same two-phase pattern (series from src client's SERIES map); one request per series for the whole range, FRED_API_KEY env for extract; backfilled 2014→2026
-README.md                         # project overview + architectural decisions
+README.md                         # project overview + diagrams + how to run (front door)
+ADR.md                            # architectural decision records (infra/platform; cross-cutting + per-pipeline)
 RUNBOOK.md                        # operational commands + per-pipeline detail (secrets paths, perf, troubleshooting)
 ```
 
@@ -106,7 +107,7 @@ S3 layout is identical across all three (`raw/<source>/.../<unit>.json`, `curate
 - **Transformer (dbt):** account role `ZEUS_DEV_TRANSFORMER_ROLE` + key-pair service user `ZEUS_DEV_TRANSFORMER` (`infra/core/snowflake_transform.tf`) — read-only on the landing schemas, `CREATE SCHEMA` on `ZEUS_DEV`, owns the modeled schemas; rolled up to SYSADMIN. Public key in tfvars (`var.transformer_public_key`), private key in SSM (`/zeus/dev/snowflake/transformer_private_key`); manual local dbt runs keep using the gitignored `sf_transformer.p8`.
 - **CI clone runner:** account role `ZEUS_DEV_CI_ROLE` + key-pair service user `ZEUS_DEV_CI` (`infra/core/snowflake_ci.tf`) — `CREATE DATABASE` on the account, USAGE on `ZEUS_DEV` + the warehouse, **plus the transformer role granted into it** (cloned child objects keep source grants/ownership, so only transformer privileges work inside a clone). Public key in tfvars (`var.ci_public_key`); private key in GitHub Actions secrets (`SNOWFLAKE_CI_PRIVATE_KEY`), local copy `sf_ci.p8` (gitignored). Used only by `.github/workflows/dbt-clone-ci.yml`.
 - **Table contract:** append-only landing; duplication from the lookback overlap is deduped downstream in dbt (EIA on `(period, respondent, fueltype)`, NOAA on `(date, station)`, FRED on `(series, date)`) keeping the latest `ingestion_date`. Per-file load metadata makes same-day re-runs idempotent.
-- **Module note:** EIA's landing resources were originally inline in `snowflake_eia.tf`; they were moved into the module via `terraform state mv` (no destroy/recreate — the module reproduces every name/comment exactly). See README cross-cutting decision for the move list.
+- **Module note:** EIA's landing resources were originally inline in `snowflake_eia.tf`; they were moved into the module via `terraform state mv` (no destroy/recreate — the module reproduces every name/comment exactly). See the ADR.md `snowflake_landing` decision for the move list.
 
 ## Pre-commit hooks
 
@@ -114,7 +115,7 @@ S3 layout is identical across all three (`raw/<source>/.../<unit>.json`, `curate
 
 ## Decisions reference
 
-`README.md` records the architectural decisions for the platform — cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) at the top, pipeline-specific decisions in their own sections. Modeling and business-rule decisions for the dbt layer (grain, metric definitions, join semantics) live in `transform/DECISIONS.md` (`M-N` entries, same format); the enforceable contract (tests, column docs) stays in each layer's `schema.yml`. Read the relevant file before proposing structural or modeling changes.
+`ADR.md` (repo root) records the architectural decisions for the platform — cross-cutting decisions (region, Terraform structure, S3 layout, secrets, packaging, observability, shared helpers) at the top, pipeline-specific decisions in their own sections. Modeling and business-rule decisions for the dbt layer (grain, metric definitions, join semantics) live in `transform/DECISIONS.md` (`M-N` entries, same format); the enforceable contract (tests, column docs) stays in each layer's `schema.yml`. Read the relevant file before proposing structural or modeling changes.
 
 ## Working norms
 

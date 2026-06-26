@@ -20,14 +20,13 @@ infra/build/
 
 # Data / pipelines
 extraction/
+dashboard/
 
 # Secrets & local config
 .env
 .claude/
-ADR.md
 temp_decisions
 snowflake.md
-RUNBOOK.md
 
 # Snowflake loader key-pairs — private keys never committed (set in SSM out-of-band)
 *.p8

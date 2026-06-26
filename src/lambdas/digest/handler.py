@@ -34,7 +34,7 @@ def lambda_handler(event, context) -> dict:
         (source, _todays_report(source, today), _skip_history(source, today))
         for source in SOURCES
     ]
-    # dbt renders as its own section, not a fan-out source — SOURCES stays eia,noaa.
+    # dbt renders as its own section, not a fan-out source — it is not in SOURCES.
     dbt_report = _todays_report("dbt", today)
     subject, body = report.format_digest(
         today.isoformat(), sections, SKIP_HISTORY_DAYS, dbt_report
