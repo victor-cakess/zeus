@@ -1,7 +1,7 @@
 """Generate the Zeus build & deploy diagram (docs/deploy.png) with real cloud logos.
 
 Companion to architecture.py: that one shows the platform at *runtime*, this one
-shows how code *ships* — the two packaging paths and the CD pipeline.
+shows how code *ships* — PR validation, the two packaging paths, and the CD pipeline.
 
 Diagram-as-code via mingrammer/diagrams (https://diagrams.mingrammer.com/).
 Requires Graphviz on PATH (`apt install graphviz` / `brew install graphviz`).
@@ -16,6 +16,7 @@ from diagrams.aws.security import IAMRole
 from diagrams.aws.storage import S3
 from diagrams.onprem.ci import GithubActions
 from diagrams.onprem.client import User
+from diagrams.saas.analytics import Snowflake
 
 graph_attr = {
     "fontsize": "16",
@@ -33,16 +34,15 @@ with Diagram(
     direction="LR",
     graph_attr=graph_attr,
 ):
-    # ---- Zip path: ingest (EIA/NOAA/FRED) + digest Lambdas -------------------
-    with Cluster("Zip Lambdas — local build (Terraform apply)"):
-        dev = User("developer\nuv pip install\n--target → zip")
-        artifacts = S3("S3\nbuild artifacts\n(zip ~49 MiB)")
-        zip_lambdas = Lambda("ingest + digest\nLambdas")
+    # ---- PR validation: zero-copy clone CI (decision 15) --------------------
+    # On PRs touching transform/**: build dbt against a throwaway clone of
+    # ZEUS_DEV so prod is never touched, then drop it. Gates merge-to-dev.
+    with Cluster("PR validation — clone CI (on PR, transform/**)"):
+        clone_ci = GithubActions("dbt-clone-ci.yml")
+        clone = Snowflake("ZEUS_CI_PR_<n>\nzero-copy clone of ZEUS_DEV\ndbt build → DROP")
+        clone_ci >> Edge(label="CREATE CLONE →\ndbt build → DROP") >> clone
 
-        dev >> Edge(label="upload") >> artifacts
-        artifacts >> Edge(label="s3_key reference") >> zip_lambdas
-
-    # ---- Container path: dbt Lambda via GitHub Actions CD (Phase 2.5) --------
+    # ---- Container path: dbt Lambda via GitHub Actions CD (decision 16) -----
     with Cluster("dbt Lambda — CD on merge to dev (GitHub Actions)"):
         gha = GithubActions("dbt-deploy.yml\ndocker build")
         oidc = IAMRole("zeus-dev-dbt-deploy\n(assumed via OIDC —\nno long-lived keys)")
@@ -53,3 +53,15 @@ with Diagram(
         oidc >> Edge(label="push image") >> ecr
         ecr >> Edge(label="update-function-code") >> dbt_lambda
         dbt_lambda >> Edge(label="smoke-invoke\n(deploy gate:\nfails on bad test)", style="dashed") >> gha
+
+    # ---- Zip path: ingest (EIA/NOAA/FRED) + digest Lambdas -----------------
+    with Cluster("Zip Lambdas — local build (Terraform apply)"):
+        dev = User("developer\nuv pip install\n--target → zip")
+        artifacts = S3("S3\nbuild artifacts\n(zip ~49 MiB)")
+        zip_lambdas = Lambda("ingest + digest\nLambdas")
+
+        dev >> Edge(label="upload") >> artifacts
+        artifacts >> Edge(label="s3_key reference") >> zip_lambdas
+
+    # Clone CI must pass, then the merge to dev triggers the image CD.
+    clone >> Edge(label="merge to dev\nif green", style="bold") >> gha

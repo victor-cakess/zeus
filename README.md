@@ -47,7 +47,7 @@ flowchart TB
 
 ### Build & deploy
 
-How code ships (distinct from the runtime view above). Two packaging paths: the ingest/digest Lambdas build locally as zips uploaded to S3; the dbt Lambda ships as a container image via GitHub Actions CD (OIDC — no long-lived keys), gated by a smoke-invoke.
+How code ships (distinct from the runtime view above). dbt/transform PRs are first validated by a **zero-copy clone CI** — build against a throwaway `CLONE` of `ZEUS_DEV`, then drop it, so prod is never touched ([ADR #15](ADR.md#15-pr-time-dbt-validation-build-against-a-zero-copy-clone-of-zeus_dev)). On merge to dev the dbt Lambda ships as a container image via GitHub Actions CD (OIDC — no long-lived keys), gated by a smoke-invoke ([ADR #16](ADR.md#16-dbt-image-cd-deploy-decoupled-from-terraform-github-oidc)). The ingest/digest Lambdas build locally as zips uploaded to S3.
 
 ![Zeus build & deploy](docs/deploy.png)
 
