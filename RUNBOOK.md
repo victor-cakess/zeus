@@ -188,7 +188,7 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 
 ### NOAA daily ingestion
 
-- **Trigger detail:** runs **in parallel with EIA** — nothing the two pipelines touch contends (different APIs, S3 prefixes, Snowflake tables/users). 14 BAs: `CISO, PJM, ERCO, MISO, ISNE, NYIS, SWPP, TVA, SOCO, DUK, FPL, BPAT, PSCO, SRP`.
+- **Trigger detail:** runs **in parallel with EIA and FRED** — nothing the parallel sources touch contends (different APIs, S3 prefixes, Snowflake tables/users). 14 BAs: `CISO, PJM, ERCO, MISO, ISNE, NYIS, SWPP, TVA, SOCO, DUK, FPL, BPAT, PSCO, SRP`.
 - **Fan-out unit = BA.** Each BA maps to 3–10 weather stations (the `STATIONS` map in `src/lambdas/noaa/ingest/client.py`); the client fetches all of a BA's stations in **one batched NCEI request** (comma-separated `stations=`) and tags every row with its `ba`. Raw layout is one `<ba>.json` per BA, mirroring EIA.
 - **Schema:** wide — 13 datatypes (`TMAX, TMIN, TAVG, PRCP, SNOW, SNWD, AWND, WSF2, WSF5, WDF2, RHAV, ASLP, ADPT`), metric units, plus `ingestion_date`. Absent datatypes land null. `lookback_window_dates` gives a rolling 7-day date window (NOAA data lags a few days, so the lookback catches late/QC-revised days).
 - **Secrets:** Snowflake loader key only, SSM `/zeus/dev/snowflake/noaa_loader_private_key`. No api-key parameter (NCEI `daily-summaries` needs none).

@@ -548,7 +548,7 @@ Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-
 
 **Chosen:** Each run pulls the last 7 days (`lookback_window_dates`) into today's partition; append-only, deduped downstream on `(date, station)` keeping the latest `ingestion_date`.
 
-**Why:** NCEI daily-summaries are **provisional and lag** — recent days arrive late (the smoke test's 7-day window only had data through 3 days prior) and get QC-revised. The overlap catches both, exactly as EIA's lookback catches EIA's corrections. NOAA runs in parallel with EIA at 07:00 UTC as a branch of the daily state machine (decision 14) — nothing the two pipelines touch contends (different APIs, S3 prefixes, Snowflake tables/users). Observed daily runs: 5–50 s, avg ~13.5 s.
+**Why:** NCEI daily-summaries are **provisional and lag** — recent days arrive late (the smoke test's 7-day window only had data through 3 days prior) and get QC-revised. The overlap catches both, exactly as EIA's lookback catches EIA's corrections. NOAA runs in parallel with EIA and FRED at 07:00 UTC as branches of the daily state machine (decision 14) — nothing the parallel sources touch contends (different APIs, S3 prefixes, Snowflake tables/users). Observed daily runs: 5–50 s, avg ~13.5 s.
 
 ### NOAA-5. Historical backfill: two-phase, day-partitioned; force IPv4 from local dev
 

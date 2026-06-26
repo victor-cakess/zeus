@@ -9,7 +9,7 @@ possible — grain, column descriptions, and tests in each layer's `schema.yml` 
 model docs. If it's testable, it goes in the yml; if it's a judgment call among
 alternatives, it goes here. The same rule should never be worded in both places.
 
-Entries are numbered `M-N` and follow the README ADR format: decision,
+Entries are numbered `M-N` and follow the `ADR.md` ADR format: decision,
 alternatives considered, why, trade-offs.
 
 ---
