@@ -432,3 +432,41 @@ later if an analysis demands it.
 **Trade-offs:**
 - A price-vs-generation analysis writes its own join rather than reading one wide
   table. Revisit the embed-vs-join-yourself call when such a consumer appears.
+
+---
+
+## M-13. Reporting layer: 1:1 pass-through views as a governance boundary, not a transform
+
+**Chosen:** A fourth dbt layer, `reporting` (`ZEUS_DEV.REPORTING`, views), sits above
+marts: one view per mart (`vw_energy_daily`, `vw_generation_hourly`,
+`vw_fuel_prices_daily`), each a **1:1 pass-through** of its mart via `ref()` with **no
+logic** — same grain, same columns. It carries **no tests** (the marts already enforce
+the not_null/unique/accepted_range contracts; re-testing a pass-through is redundant
+cost every build) and **exposes all mart columns**, including FRED's `_is_observed` /
+`_staleness_days` companions (M-11). It exists for **access governance, not modeling**:
+it's the only schema the public dashboard's least-privilege role can `SELECT`, so the
+marts/intermediate/staging/landing stay invisible to an internet-facing credential.
+The access half (role, warehouse, resource monitor, grants) lives in `ADR.md` #17.
+
+**Alternatives considered:**
+- **Point the dashboard at the marts directly** — no extra layer, but then the public
+  role needs `SELECT` on `MARTS`, coupling the public surface to physical mart changes
+  and exposing the whole consumption schema. A thin view layer gives a stable,
+  curated, separately-grantable contract.
+- **Curate columns now** (expose only what the dashboard currently charts) — tighter,
+  but the dashboard is still evolving; trimming would mean editing a view on every new
+  chart. Full pass-through preserves flexibility; tighten once the dashboard stabilizes.
+- **Add tests on the views** — duplicates the marts' contracts for no new coverage.
+
+**Why:**
+- Keeps the marts as the internal consumption surface (M-5) while giving *external*
+  consumers a deliberately narrow, governed door — the view layer is the seam where
+  "what we model" meets "what a public app may read."
+- Views are free to keep fresh (rebuilt every `dbt build`) and `ref()`-linked, so the
+  serving surface can't drift from the marts.
+
+**Trade-offs:**
+- A genuinely useful column hidden behind `select <cols>` (the two facts) needs a
+  one-line view edit to surface — the cost of an explicit contract over `select *`.
+- Another layer to keep in mind when reasoning about lineage, though it adds zero
+  business logic.

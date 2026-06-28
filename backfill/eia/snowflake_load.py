@@ -11,7 +11,7 @@ metadata loads each Parquet exactly once. Reuses the production COPY helper
 Run ONCE. Do not re-run months later — load metadata expires after 64 days, so a
 second whole-stage COPY would re-load files older than that as duplicate loads.
 
-Config via env: SNOWFLAKE_ACCOUNT (required, e.g. WYCCXHS-KUB52402),
+Config via env: SNOWFLAKE_ACCOUNT (required, e.g. <org>-<account>),
 SNOWFLAKE_PRIVATE_KEY_FILE (required, path to the loader .p8). The rest default to
 the ZEUS_DEV/EIA names and only need overriding if you renamed objects.
 """

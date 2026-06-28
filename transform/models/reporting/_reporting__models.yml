@@ -1,0 +1,79 @@
+version: 2
+
+models:
+  - name: vw_energy_daily
+    description: >
+      Public-serving view over fct_energy_daily — the governance boundary for the
+      Streamlit dashboard. 1:1 pass-through (no logic): ZEUS_DEV_DASHBOARD_ROLE gets
+      SELECT on REPORTING.* only, never on MARTS or the landing schemas. Same grain
+      and columns as fct_energy_daily (one row per ba/date; weather columns nullable
+      for uncovered BAs and inside NOAA's lag, M-4). Rebuilt as a view every dbt build.
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+      - name: date
+        description: UTC calendar day of the generation periods (M-7).
+      - name: total_net_mwh
+        description: Daily sum of hourly net generation (MWh), negatives included.
+      - name: total_gross_mwh
+        description: Daily sum of hourly gross production (MWh).
+      - name: renewable_gross_mwh
+        description: Daily sum of hourly renewable gross production (MWh).
+      - name: renewable_share
+        description: Ratio of daily sums (M-6); null when the day produced no gross generation.
+      - name: hours_reported
+        description: Distinct generation hours behind the BA-day (24 = complete).
+      - name: station_count
+        description: Stations behind the BA-day's weather means; null when no weather joined (M-4).
+      - name: tmax
+        description: BA-mean daily max temperature (°C); nullable (M-4).
+      - name: tmin
+        description: BA-mean daily min temperature (°C); nullable (M-4).
+      - name: tavg
+        description: Derived (tmax + tmin) / 2 over BA-level means (M-3); nullable (M-4).
+      - name: prcp
+        description: BA-mean precipitation (mm); nullable (M-4).
+      - name: snow
+        description: BA-mean snowfall (mm); nullable (M-3/M-4).
+      - name: snwd
+        description: BA-mean snow depth (mm); nullable (M-3/M-4).
+      - name: awnd
+        description: BA-mean average daily wind speed (m/s); nullable (M-4).
+      - name: wsf2
+        description: BA-mean fastest 2-minute wind speed (m/s); nullable (M-4).
+      - name: wsf5
+        description: BA-mean fastest 5-second wind speed (m/s); nullable (M-4).
+      - name: rhav
+        description: BA-mean average relative humidity (%); nullable (M-3/M-4).
+      - name: aslp
+        description: BA-mean sea-level pressure (hPa); nullable (M-3/M-4).
+      - name: adpt
+        description: BA-mean dew point (°C); nullable (M-3/M-4).
+
+  - name: vw_generation_hourly
+    description: >
+      Public-serving view over fct_generation_hourly (the dashboard duck-curve chart).
+      1:1 pass-through; one row per (ba, period), period in UTC (M-7).
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+      - name: period
+        description: Hour of generation, UTC (timestamp_ntz).
+      - name: total_net_mwh
+        description: Net generation for the hour (MWh), negatives included (M-2).
+      - name: total_gross_mwh
+        description: Gross production for the hour (MWh) — the renewable_share denominator (M-1).
+      - name: renewable_gross_mwh
+        description: Solar + wind + hydro gross production for the hour (MWh).
+      - name: renewable_share
+        description: renewable_gross_mwh / total_gross_mwh, in [0, 1] (M-1); null when no gross.
+
+  - name: vw_fuel_prices_daily
+    description: >
+      Public-serving view over fct_fuel_prices_daily (the dashboard price charts).
+      1:1 pass-through including the 15 series and their _is_observed / _staleness_days
+      companions (M-11). National grain (one row per date, no ba). Values are
+      latest-revision, not point-in-time — fine for display, leakage for ML (M-11).
+    columns:
+      - name: date
+        description: Calendar date (one row per day).
