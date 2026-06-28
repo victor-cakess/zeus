@@ -353,6 +353,28 @@ rows = [normalize_row(r, today)
 
 ---
 
+## 17. Public dashboard: a governed read-only serving layer (REPORTING views + leaf role + capped warehouse)
+
+**Chosen:** The public Streamlit dashboard reads Snowflake through a dedicated least-privilege boundary, not as the dbt transformer it used to. Three pieces: (1) a `ZEUS_DEV.REPORTING` schema of **1:1 pass-through views** over the marts (`vw_energy_daily`, `vw_generation_hourly`, `vw_fuel_prices_daily`), defined as **dbt models** (`transform/models/reporting/`) so they rebuild every `dbt build` via `ref()`; (2) a **leaf** account role + key-pair service user (`ZEUS_DEV_DASHBOARD`) with `SELECT` on the REPORTING views **and nothing else** — never the marts, staging, intermediate, or landing — deliberately **not** rolled up to SYSADMIN; (3) a **dedicated XS warehouse** (`ZEUS_DEV_DASHBOARD_WH`, single cluster, 60s statement timeout) bound to a **25-credit/month resource monitor** that hard-suspends at 100% (notify at 75%). Terraform owns the schema shell + role/user/warehouse/monitor + grants (`infra/core/snowflake_dashboard.tf`); dbt owns the view SQL. The dashboard role's `SELECT` is a **future + all views** grant on REPORTING, so dbt-built views authorize automatically with no second `apply`. Hosted on **Streamlit Community Cloud**; the private key lives in Streamlit secrets, **not** SSM.
+
+**Alternatives considered:**
+- **Keep connecting as `ZEUS_DEV_TRANSFORMER`** — the role that owns and can drop every modeled schema. Handing that credential to an internet-facing app is the governance hole this closes.
+- **Grant the dashboard role `SELECT` on the mart tables directly** — works, but couples the public surface to physical mart changes and exposes every column. Views give a stable, column-curated contract and let the role be locked to a single schema.
+- **Terraform-managed views** (`snowflake_view` resources) — fully self-contained in one file, but the view SQL would live in HCL and drift from the marts; dbt models stay in lockstep via `ref()` and ship through the existing Phase-2.5 CD.
+- **Daily static export (DuckDB/Parquet)** so the public never touches Snowflake — lowest cost/risk, but adds a second pipeline and freezes the model while the dashboard is still evolving. Deferred until the dashboard stabilizes.
+
+**Why:**
+- A public app needs an identity whose worst case is bounded: even if the key leaked, `ZEUS_DEV_DASHBOARD` can only `SELECT` three views. Defense-in-depth on top of the fact that, server-side, visitors never see the key at all.
+- The resource monitor is the real answer to "a public dashboard could blow up my bill" — a hard credit ceiling independent of traffic, on an isolated warehouse so the cap is meaningful and dashboard load can't slow dbt/ingest. Single-cluster means a spike queues instead of scaling out (cost stays pinned).
+- dbt-defined views keep the serving layer in the modeling DAG (testable, `ref()`-linked, auto-refreshed daily); Terraform-defined access keeps governance in IaC. Clean split: **dbt owns modeling, Terraform owns access.**
+
+**Trade-offs:**
+- TF creates the REPORTING schema shell but dbt fills it — so the transformer needs a `USAGE`+`CREATE VIEW` grant on REPORTING (TF provides it). dbt's `create schema if not exists` is a verified no-op against the pre-created schema.
+- The `notify_users` trigger points at the admin login (the service user has no email), so the 75% email may not deliver — the suspend trigger is the actual guardrail.
+- Onboarding a new public chart that needs a new column means touching the view (one line) — the cost of a curated surface over `select *`.
+
+---
+
 # Pipeline-specific decisions
 
 ## EIA pipeline

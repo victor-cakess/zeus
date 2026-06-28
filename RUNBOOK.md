@@ -213,3 +213,51 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 
 - **What it does (detail):** for each source in `SOURCES` (`eia,noaa,fred`), reads today's `reports/<source>/.../run_report.json` from S3, computes a 30-day skip history, and publishes **one** combined email to `zeus-dev-alerts` (succeeded/skipped counts + Snowflake rows loaded per source). It also reads `reports/dbt/.../run_report.json` and renders it as its own section (subject chip like `dbt 9 models / 52 tests` or `dbt FAILED 2 tests`, body lists failed-test names). A source or dbt run that wrote no report (it crashed → the execution-level alert already fired) is surfaced as "no report", not a crash. Reuses `src/shared/report.py` (`format_digest`, `format_dbt_section`).
 - **SNS caps subjects at 100 ASCII chars** — the subject is deliberately static (`Zeus daily report — <date>`); all per-source/dbt detail lives in the body (per-source chips overflowed the cap at 3 sources).
+
+### Public dashboard (Streamlit + governed serving layer)
+
+The Streamlit dashboard (`dashboard/app.py`) reads the `ZEUS_DEV.REPORTING` views as the least-privilege `ZEUS_DEV_DASHBOARD` service user. Infra (role, user, warehouse, resource monitor, REPORTING schema shell, grants) is in `infra/core/snowflake_dashboard.tf`; the views are dbt models (`transform/models/reporting/`). See ADR #17.
+
+**One-time setup / key rotation:**
+
+```bash
+# 1. Generate the dashboard key-pair (PKCS8, unencrypted — same shape as the loaders)
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out sf_dashboard.p8 -nocrypt
+openssl rsa -in sf_dashboard.p8 -pubout -out sf_dashboard.pub
+# 2. Public-key BODY (strip header/footer + newlines) → infra/core/terraform.tfvars (dashboard_public_key)
+grep -v 'PUBLIC KEY' sf_dashboard.pub | tr -d '\n'; echo
+# 3. Apply (creates/updates the role/user/warehouse/monitor + REPORTING shell + grants)
+cd infra/core && terraform apply
+```
+`sf_dashboard.p8` / `sf_dashboard.pub` are gitignored (same as `sf_transformer.p8`). To rotate: regenerate, update `dashboard_public_key`, `terraform apply`, then update the Streamlit secret.
+
+**Apply / deploy order:** (a) keypair → tfvars; (b) `terraform apply infra/core`; (c) merge the `transform/models/reporting/` models to `dev` → the dbt-image CD builds the views into `REPORTING` (the role's **future-views** grant authorizes them with no second apply); (d) set Streamlit secrets + deploy.
+
+**Streamlit Community Cloud secrets** (app Settings → Secrets, TOML):
+```toml
+SNOWFLAKE_ACCOUNT = "WYCCXHS-KUB52402"
+SNOWFLAKE_PRIVATE_KEY = """
+-----BEGIN PRIVATE KEY-----
+...sf_dashboard.p8 contents...
+-----END PRIVATE KEY-----
+"""
+# user/role/warehouse default to the dashboard identity in app.py — no need to set them.
+```
+
+**Run locally** (key from a file, not secrets):
+```bash
+export SNOWFLAKE_ACCOUNT=WYCCXHS-KUB52402
+export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/sf_dashboard.p8"
+uv run --with streamlit --with snowflake-connector-python --with pandas \
+    --with numpy --with altair --no-project streamlit run dashboard/app.py
+```
+
+**Resource monitor (`ZEUS_DEV_DASHBOARD_MONITOR`):** 25 credits/month, notify at 75%, **suspend at 100%** (monthly reset). If the dashboard hits the cap it suspends until the next cycle — bump the quota in `snowflake_dashboard.tf` (`credit_quota`) and re-apply, or `alter resource monitor ZEUS_DEV_DASHBOARD_MONITOR set credit_quota = N`. Inspect: `show resource monitors;` / `show warehouses like 'ZEUS_DEV_DASHBOARD_WH';`.
+
+**Verify the least-privilege boundary** (as ACCOUNTADMIN):
+```sql
+use role ZEUS_DEV_DASHBOARD_ROLE; use warehouse ZEUS_DEV_DASHBOARD_WH;
+select * from ZEUS_DEV.reporting.vw_energy_daily limit 5;  -- WORKS
+select * from ZEUS_DEV.marts.fct_energy_daily limit 5;     -- DENIED (not authorized)
+select * from ZEUS_DEV.eia.eia_grid limit 5;               -- DENIED (landing)
+```

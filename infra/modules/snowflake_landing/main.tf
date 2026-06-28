@@ -110,8 +110,12 @@ resource "snowflake_stage" "this" {
   name                = local.stage_name
   url                 = local.curated_location
   storage_integration = snowflake_storage_integration.this.name
-  file_format         = "TYPE = PARQUET USE_LOGICAL_TYPE = TRUE"
-  comment             = "External stage over curated/${var.source_name}/ for COPY INTO ${local.table_name}."
+  # Written in the exact form the provider reads back from Snowflake (NULL_IF=[] default,
+  # lowercase true) — file_format is a freeform string, so any other spelling of the same
+  # effective format shows as perpetual plan drift. USE_LOGICAL_TYPE=true is required so
+  # EIA's period (INT64) / NOAA's date (INT32) load as real timestamps, not raw ints.
+  file_format = "TYPE = PARQUET NULL_IF = [] USE_LOGICAL_TYPE = true"
+  comment     = "External stage over curated/${var.source_name}/ for COPY INTO ${local.table_name}."
 }
 
 # --- Least-privilege key-pair loader (the Lambda authenticates as this) -----

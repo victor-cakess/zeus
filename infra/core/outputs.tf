@@ -32,3 +32,17 @@ output "snowflake_transformer_user" {
 output "snowflake_transformer_role" {
   value = snowflake_account_role.transformer.name
 }
+
+# The public Streamlit dashboard connects as this leaf service user / role (key-pair
+# auth), SELECT on the REPORTING views only — never the marts or landing.
+output "snowflake_dashboard_user" {
+  value = snowflake_service_user.dashboard.name
+}
+
+output "snowflake_dashboard_role" {
+  value = snowflake_account_role.dashboard.name
+}
+
+output "snowflake_dashboard_warehouse" {
+  value = snowflake_warehouse.dashboard.name
+}

@@ -31,3 +31,11 @@ models:
     # mart; DECISIONS.md M-5).
     marts:
       +schema: marts
+    # reporting: the public serving surface — read-only 1:1 views over the marts,
+    # the only schema the dashboard role can SELECT. Views (always fresh, cheap),
+    # built into the REPORTING schema. Terraform owns the schema shell + the
+    # dashboard role/user/warehouse/monitor (infra/core/snowflake_dashboard.tf);
+    # dbt owns the view SQL.
+    reporting:
+      +materialized: view
+      +schema: reporting

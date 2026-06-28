@@ -64,3 +64,8 @@ variable "ci_public_key" {
   type        = string
   description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_CI service user (GitHub Actions dbt clone CI). The matching private key lives in GitHub Actions secrets; nothing secret here."
 }
+
+variable "dashboard_public_key" {
+  type        = string
+  description = "RSA public key body (no PEM header/footer) for the ZEUS_DEV_DASHBOARD service user (public Streamlit dashboard). The matching private key lives in Streamlit Community Cloud secrets, NOT SSM; nothing secret here."
+}
