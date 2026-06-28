@@ -1,0 +1,10 @@
+# Dependencies for the standalone Streamlit dashboard (dashboard/app.py).
+# Streamlit Community Cloud installs from this file (it sits next to the entrypoint).
+# Kept separate from the project's pyproject.toml/uv.lock — the dashboard is NOT a
+# project dependency and never ships in a Lambda. cryptography comes pinned-compatible
+# via snowflake-connector-python (key-pair auth), so it's not listed separately.
+streamlit
+snowflake-connector-python
+pandas
+numpy
+altair
