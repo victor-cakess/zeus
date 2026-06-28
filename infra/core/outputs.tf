@@ -14,7 +14,7 @@ output "alerts_topic_arn" {
   value = aws_sns_topic.alerts.arn
 }
 
-# Account identifier in org-account form, e.g. WYCCXHS-KUB52402 — consumed by
+# Account identifier in org-account form, e.g. <org>-<account> — consumed by
 # pipelines that connect to Snowflake (the snowflake-connector `account` param).
 output "snowflake_account" {
   value = "${var.organization_name}-${var.account_name}"

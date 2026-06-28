@@ -235,7 +235,7 @@ cd infra/core && terraform apply
 
 **Streamlit Community Cloud secrets** (app Settings → Secrets, TOML):
 ```toml
-SNOWFLAKE_ACCOUNT = "WYCCXHS-KUB52402"
+SNOWFLAKE_ACCOUNT = "<org>-<account>"
 SNOWFLAKE_PRIVATE_KEY = """
 -----BEGIN PRIVATE KEY-----
 ...sf_dashboard.p8 contents...
@@ -246,7 +246,7 @@ SNOWFLAKE_PRIVATE_KEY = """
 
 **Run locally** (key from a file, not secrets):
 ```bash
-export SNOWFLAKE_ACCOUNT=WYCCXHS-KUB52402
+export SNOWFLAKE_ACCOUNT=<org>-<account>   # e.g. from `terraform -chdir=infra/core output -raw snowflake_account`
 export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/sf_dashboard.p8"
 uv run --with streamlit --with snowflake-connector-python --with pandas \
     --with numpy --with altair --no-project streamlit run dashboard/app.py
