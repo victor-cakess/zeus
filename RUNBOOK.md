@@ -14,6 +14,11 @@ uv sync --group dev
 uv run pre-commit install
 uv run pre-commit run --all-files
 
+# Lambda unit tests (offline — no AWS/Snowflake/network; the suite stubs every
+# external call, so it runs in well under a second and needs no credentials).
+uv run pytest -q                          # the whole suite
+uv run pytest tests/shared/test_ingest.py -v   # one module, verbose
+
 # Terraform — core (S3 + SNS + Snowflake warehouse/db + per-source landing stacks); apply this first.
 # Requires in terraform.tfvars (gitignored): role = "ACCOUNTADMIN" (to create the
 # storage integrations + service users) and one loader RSA public-key body per source

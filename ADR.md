@@ -373,6 +373,24 @@ rows = [normalize_row(r, today)
 - The `notify_users` trigger points at the admin login (the service user has no email), so the 75% email may not deliver — the suspend trigger is the actual guardrail.
 - Onboarding a new public chart that needs a new column means touching the view (one line) — the cost of a curated surface over `select *`.
 
+## 18. Offline unit tests for the Lambda logic tier (pytest, in-memory fakes)
+
+**Chosen:** A pytest suite under `tests/` covers the Lambdas' **logic tier** with zero external calls — every AWS/Snowflake/network dependency is stubbed. `pyproject.toml` carries `pytest` in the `dev` group and `[tool.pytest.ini_options]` sets `pythonpath = ["src"]` so tests import `shared` exactly as the Lambda zip does at runtime. The high-value target is `shared/ingest.run_ingest`: its fault-tolerance contract (per-unit skip vs total-outage `ValueError`, Snowflake-load `RuntimeError`, and **report-before-raise** on both hard failures) is pinned by tests that swap `s3_io`/`ssm`/`snowflake_io` for in-memory fakes via `monkeypatch` on the module attributes (the singleton-substitution convention this repo already uses). The rest is pure-function coverage: `paths` (S3-layout round-trip), `time_window`, `report` (run-report/skip-history/dbt-report shaping + digest bodies), and each source's `normalize_row` (asserted against its `pa.schema`). Wired into CI as the offline `unit-tests` job (Phase 1).
+
+**Alternatives considered:**
+- **Keep relying only on the end-to-end smoke invocation.** It's the sole check for the integration boundary (IAM, `USE_LOGICAL_TYPE`, storage integration, packaging) and stays — but it's slow, costs real API/warehouse calls, and can't exercise failure paths (total outage, load failure) without deliberately breaking prod. It verifies *wiring*, not *logic*; nothing pinned the logic.
+- **`moto`/localstack to fake AWS.** Heavier dependency and slower for no gain here — the shared clients are already thin singletons, so hand-written in-memory fakes are smaller, faster, and match the existing monkeypatch convention.
+- **Tier-2 HTTP-client tests now** (`fetch_unit` retry/pagination via mocked `requests`). Deferred — lower risk of change and more mocking; the logic tier came first.
+
+**Why:**
+- The fault-tolerance contract is the platform's trust story, yet it was the *only* thing a smoke test couldn't check safely. Tests make "skip a bad unit, fail hard on a total outage, always write the report before raising" executable and regression-proof, in ~0.1 s.
+- `pythonpath = ["src"]` + fakes-not-mocks (`FakeS3` does a real put→read round-trip) means the tests exercise the real consolidation path, not a hollow stand-in — while needing no credentials, so they run on every PR in Phase-1 CI.
+- The `normalize_row`-against-`pa.schema` assertion catches `schema.py`↔table drift that would otherwise only surface as a Snowflake load error in production.
+
+**Trade-offs:**
+- Unit tests **do not replace** the smoke invocation — they cover disjoint failure classes (logic vs. the stubbed integration boundary). "Done means" keeps both tiers.
+- The three source `schema.py` files share a module name, so tests load them by file path (`conftest.load_module`) rather than a plain import — a small amount of test-harness plumbing.
+
 ---
 
 # Pipeline-specific decisions

@@ -1,6 +1,7 @@
 # Phase 1 CI — offline gates only: no AWS/Snowflake credentials, no state access.
 # Mirrors the local pre-commit + done-means offline checks so a PR can't merge
-# with secrets, unparseable dbt, or invalid/unformatted Terraform.
+# with secrets, unparseable dbt, invalid/unformatted Terraform, or failing Lambda
+# unit tests.
 #
 # Phase 2 (dbt build on PRs against a zero-copy clone of ZEUS_DEV) lives in its own
 # workflow, dbt-clone-ci.yml — separate file because it needs a transform/** paths
@@ -49,6 +50,16 @@ jobs:
       # in use (the runner has no ~/.dbt to fall back to).
       - run: uv run dbt parse --profiles-dir .
         working-directory: transform
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # Default (dev) group carries pytest + pyarrow + boto3 — the Lambda unit suite
+      # runs fully offline (in-memory fakes for S3/SSM/Snowflake), so no creds here.
+      - run: uv sync
+      - run: uv run pytest -q
 
   terraform:
     runs-on: ubuntu-latest

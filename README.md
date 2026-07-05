@@ -135,6 +135,7 @@ erDiagram
 | Storage | S3 (raw / curated / reports), Snowflake (landing + dbt models) |
 | Transform | dbt (`dbt-snowflake`), staging → intermediate → marts |
 | Alerting | SNS (one daily digest email + failure alerts) |
+| Testing | pytest — offline Lambda unit suite (in-memory fakes for S3/SSM/Snowflake) |
 | CI/CD | GitHub Actions — offline gates, zero-copy clone CI, OIDC image CD |
 
 ## Project status
@@ -142,7 +143,7 @@ erDiagram
 - **Ingestion (live):** EIA (71 balancing authorities), NOAA (14 BAs → weather stations), FRED (15 national price series). Each daily, fault-tolerant per unit.
 - **Modeling (live):** dbt — **12 models** (3 staging + 3 intermediate + 3 marts + 3 reporting views), **52 tests**.
 - **Orchestration (live):** one Step Functions state machine on a 07:00 UTC daily cron; the digest always runs, any failure alerts via SNS and marks the execution Failed.
-- **CI/CD (live):** offline gates (gitleaks + `dbt parse` + `terraform fmt/validate`), a zero-copy clone CI for dbt PRs, and a decoupled dbt-image CD via GitHub OIDC.
+- **CI/CD (live):** offline gates (gitleaks + `dbt parse` + an offline Lambda unit suite (`pytest`) + `terraform fmt/validate`), a zero-copy clone CI for dbt PRs, and a decoupled dbt-image CD via GitHub OIDC.
 - **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a Streamlit dashboard ([`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)).
 - **History:** all three sources backfilled (EIA 2017→, NOAA 2010→, FRED 2014→).
 
@@ -182,7 +183,7 @@ Secrets are never in code or state: each loader's public key is in Terraform; pr
 
 ## Key architecture decisions
 
-Highlights — the full set (16 cross-cutting + per-pipeline) is in [ADR.md](ADR.md).
+Highlights — the full set (18 cross-cutting + per-pipeline) is in [ADR.md](ADR.md).
 
 - **[One fault-tolerant Step Functions state machine](ADR.md#14-daily-orchestration-one-step-functions-state-machine-over-the-pipeline-lambdas)** — parallel ingest → dbt → digest, with per-branch catches so the digest always runs and any failure alerts (#14).
 - **[dbt-core in a container Lambda, not dbt Cloud](ADR.md#dbt-1-runner-a-container-image-lambda)** — one orchestration model, no vendor lock-in; includes the [`/dev/shm` multiprocessing workaround](ADR.md#dbt-3-lambda-runtime-detour-worth-recording-no-devshm) (DBT-1, DBT-3).
