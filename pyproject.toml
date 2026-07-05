@@ -11,6 +11,7 @@ dev = [
     "boto3>=1.43.6",
     "pre-commit>=4.6.0",
     "pyarrow>=24.0.0",
+    "pytest>=8.3.0",
     "requests>=2.32.3",
     "ruff>=0.15.12",
     "tqdm>=4.67.0",  # progress bars for the local one-off backfills
@@ -28,3 +29,9 @@ dev = [
 dbt = [
     "dbt-snowflake>=1.9,<2.0",
 ]
+
+[tool.pytest.ini_options]
+# src/ on the path so tests import the shared package exactly as the Lambda does at
+# runtime (the zip root is src/shared/, imported as `from shared import ...`).
+pythonpath = ["src"]
+testpaths = ["tests"]
