@@ -6,11 +6,19 @@ lets tests do `from shared import ...` exactly as the Lambdas do at runtime.
 """
 
 import importlib.util
+import os
 from datetime import date
 
 import pytest
 
-from shared import ingest, s3_io, snowflake_io, ssm, time_window
+# src/shared/{ssm,s3_io,sns,snowflake_io}.py build their boto3 client at import time
+# (module-level singletons). Client construction needs a region, and CI runners have
+# none configured (→ botocore NoRegionError). The tests never make a real AWS call —
+# every client is faked — so a dummy region just satisfies construction. setdefault so
+# a real local region is never clobbered. Must run BEFORE importing shared.
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+
+from shared import ingest, s3_io, snowflake_io, ssm, time_window  # noqa: E402
 
 
 def load_module(path: str, name: str):
