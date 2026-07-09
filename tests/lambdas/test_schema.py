@@ -68,6 +68,39 @@ def test_eia_normalize_missing_value_is_none(module_loader):
     _assert_schema_accepts(row, mod.SCHEMA)
 
 
+# --- EIA region-data (D / DF / NG / TI) ----------------------------------------------
+
+
+def test_eia_region_normalize_maps_dashed_keys(module_loader):
+    mod = _load(module_loader, "eia_region")
+    raw = {
+        "period": "2026-07-05T14",
+        "respondent": "PJM",
+        "respondent-name": "PJM Interconnection",
+        "type": "DF",
+        "type-name": "Day-ahead demand forecast",
+        "value": "98765.0",
+        "value-units": "megawatthours",
+    }
+    row = mod.normalize_row(raw, date(2026, 7, 5))
+
+    assert row["period"] == datetime(2026, 7, 5, 14)   # 'T14' parsed to a datetime
+    assert row["type"] == "DF"
+    assert row["type_name"] == "Day-ahead demand forecast"  # dash → underscore
+    assert row["value"] == 98765.0                      # string → float
+    assert row["ingestion_date"] == date(2026, 7, 5)
+    _assert_schema_accepts(row, mod.SCHEMA)
+
+
+def test_eia_region_normalize_missing_value_is_none(module_loader):
+    # TI can report null hours; a missing 'value' must land as None, not crash.
+    mod = _load(module_loader, "eia_region")
+    raw = {"period": "2026-07-05T14", "respondent": "PJM", "type": "TI"}
+    row = mod.normalize_row(raw, date(2026, 7, 5))
+    assert row["value"] is None
+    _assert_schema_accepts(row, mod.SCHEMA)
+
+
 # --- FRED --------------------------------------------------------------------------
 
 

@@ -1,0 +1,48 @@
+version: 2
+
+models:
+  - name: stg_eia_region__grid
+    description: >
+      EIA hourly region data, deduplicated on the lookback overlap and standardized
+      (respondent -> ba, type -> metric, value -> value_mwh). Kept narrow at native
+      grain — one row per (ba, period, metric) — so staging stays zero-judgment;
+      the wide D/DF/NG/TI pivot happens in the intermediate layer. Generation-only
+      BAs may legitimately never report D/DF — the API returns whatever series a
+      respondent publishes — so completeness across metrics is NOT asserted here.
+    columns:
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: ba
+        description: Balancing-authority code (EIA respondent). Same code set as stg_eia__generation.
+        data_tests: [not_null]
+      - name: ba_name
+        description: Human-readable balancing-authority name.
+      - name: metric
+        description: Region-data series code.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["D", "DF", "NG", "TI"]
+      - name: metric_name
+        description: Human-readable series label (Demand, Day-ahead demand forecast, ...).
+      - name: value_mwh
+        description: >
+          Value for the hour, in megawatthours. Sign convention: TI is signed
+          (positive = net exporter for the hour); D/DF/NG are magnitudes.
+      - name: value_units
+        description: Source units string (constant "megawatthours").
+        # Units contract — same rationale as stg_eia__generation: if EIA ever
+        # changes the unit, every MWh column downstream is wrong; fail loudly here.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["megawatthours"]
+      - name: ingestion_date
+        description: Date this row was ingested; used to pick the latest on dedup.
+    # Output assertion of the grain spec.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, period, metric]

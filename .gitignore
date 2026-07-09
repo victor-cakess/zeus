@@ -34,3 +34,7 @@ sf_*_loader.pub
 
 snowflake-energy-plan.md
 business_justification.md
+
+# Local planning docs — not part of the public repo
+ROADMAP.md
+docs/reference/eia_rto_master_map.json

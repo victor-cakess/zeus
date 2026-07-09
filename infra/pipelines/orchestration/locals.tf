@@ -24,6 +24,11 @@ locals {
       units        = data.terraform_remote_state.eia.outputs.balancing_authorities
     },
     {
+      name         = "eia_region"
+      function_arn = data.terraform_remote_state.eia_region.outputs.ingest_function_arn
+      units        = data.terraform_remote_state.eia_region.outputs.balancing_authorities
+    },
+    {
       name         = "noaa"
       function_arn = data.terraform_remote_state.noaa.outputs.ingest_function_arn
       units        = data.terraform_remote_state.noaa.outputs.balancing_authorities

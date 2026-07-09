@@ -131,7 +131,8 @@ cd infra/cicd && terraform init && terraform apply
 gh variable set AWS_DEPLOY_ROLE_ARN --body "$(terraform -chdir=infra/cicd output -raw deploy_role_arn)"
 
 # Terraform — orchestration (the daily state machine). Apply LAST: it consumes the
-# eia/noaa/digest/dbt roots' outputs via remote state and fails to plan until they exist.
+# ingest (eia/eia_region/noaa/fred) + digest/dbt roots' outputs via remote state and
+# fails to plan until they exist.
 cd infra/pipelines/orchestration
 terraform init && terraform apply
 
@@ -151,6 +152,9 @@ aws stepfunctions describe-execution --execution-arn <arn from above>
 # and urllib3 prefers IPv6 → ~10 min/request stall without it (a single request is ~2 s on
 # IPv4). NCEI can still 429 under heavy concurrency; the fetch retry wrapper backs off.
 uv run python backfill/eia/run.py  extract   --start 2017-01-01       # then: transform, then snowflake_load.py
+EIA_API_KEY=$(aws ssm get-parameter --name /zeus/dev/eia/api_key --with-decryption \
+  --query Parameter.Value --output text) \
+  uv run python backfill/eia_region/run.py extract --start 2015-07-01 # EIA-930 demand begins 2015-07; then: transform, then snowflake_load.py (sf_eia_region_loader.p8)
 uv run python backfill/noaa/run.py extract   --start 2010-01-01       # one batched request per BA-year
 uv run python backfill/noaa/run.py transform --start 2010-01-01       # per-day curated Parquet (S3-only, parallel)
 SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
@@ -191,6 +195,14 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 - **Alerting:** failure routing lives in the state machine. Any unhandled crash (OOM, timeout, init error) or the total-outage `ValueError` is caught by the EIA branch's Catch; the digest still runs (EIA shows as "no report"), then `CheckFailures` publishes to `zeus-dev-alerts` and fails the execution.
 - **Observed performance:** production daily runs 18–59 s, avg ~40 s (cold start + EIA API latency variance; CloudWatch `Duration`, June 2026 — a warm smoke-test run is ~12.5 s). Peak memory ~247 MB.
 
+### EIA region-data daily ingestion
+
+- **Per-invocation steps:** identical to EIA (same shared `run_ingest` orchestration, same fan-out/consolidate/COPY/report shape); target table `ZEUS_DEV.EIA_REGION.EIA_REGION_GRID`. One request-loop per BA returns all four series (D, DF, NG, TI — no `type` facet); grain `(period, respondent, type)`.
+- **Secrets:** **shares the EIA API key** (SSM `/zeus/dev/eia/api_key` — owned by the eia root's Terraform; this root only reads it); own Snowflake loader key in SSM `/zeus/dev/snowflake/eia_region_loader_private_key`.
+- **Outputs:** `raw/eia_region/.../<ba>.json`, `curated/eia_region/.../eia_region_grid.parquet`, `reports/eia_region/.../run_report.json` — same partition scheme as EIA. Rolling 7-day lookback; deduped downstream on `(period, respondent, type)` keep latest `ingestion_date`.
+- **Fault tolerance / alerting:** same contract as EIA (per-BA skip, total-outage `ValueError`, branch Catch → digest → `CheckFailures`). Generation-only BAs returning no D/DF rows is expected data shape, not an error.
+- **Observed performance:** TBD after first production runs (expect ≈ EIA's profile; ~4 series × 24 h × 7 d ≈ 675 rows/BA/run).
+
 ### NOAA daily ingestion
 
 - **Trigger detail:** runs **in parallel with EIA and FRED** — nothing the parallel sources touch contends (different APIs, S3 prefixes, Snowflake tables/users). 14 BAs: `CISO, PJM, ERCO, MISO, ISNE, NYIS, SWPP, TVA, SOCO, DUK, FPL, BPAT, PSCO, SRP`.
@@ -216,7 +228,7 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 
 ### Daily digest
 
-- **What it does (detail):** for each source in `SOURCES` (`eia,noaa,fred`), reads today's `reports/<source>/.../run_report.json` from S3, computes a 30-day skip history, and publishes **one** combined email to `zeus-dev-alerts` (succeeded/skipped counts + Snowflake rows loaded per source). It also reads `reports/dbt/.../run_report.json` and renders it as its own section (subject chip like `dbt 9 models / 52 tests` or `dbt FAILED 2 tests`, body lists failed-test names). A source or dbt run that wrote no report (it crashed → the execution-level alert already fired) is surfaced as "no report", not a crash. Reuses `src/shared/report.py` (`format_digest`, `format_dbt_section`).
+- **What it does (detail):** for each source in `SOURCES` (`eia,eia_region,noaa,fred`), reads today's `reports/<source>/.../run_report.json` from S3, computes a 30-day skip history, and publishes **one** combined email to `zeus-dev-alerts` (succeeded/skipped counts + Snowflake rows loaded per source). It also reads `reports/dbt/.../run_report.json` and renders it as its own section (subject chip like `dbt 9 models / 52 tests` or `dbt FAILED 2 tests`, body lists failed-test names). A source or dbt run that wrote no report (it crashed → the execution-level alert already fired) is surfaced as "no report", not a crash. Reuses `src/shared/report.py` (`format_digest`, `format_dbt_section`).
 - **SNS caps subjects at 100 ASCII chars** — the subject is deliberately static (`Zeus daily report — <date>`); all per-source/dbt detail lives in the body (per-source chips overflowed the cap at 3 sources).
 
 ### Public dashboard (Streamlit + governed serving layer)
