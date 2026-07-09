@@ -45,6 +45,104 @@ models:
           arguments:
             combination_of_columns: [ba, period]
 
+  - name: fct_demand_hourly
+    description: >
+      Hourly demand fact — the marts-layer materialization of
+      int_eia_region__demand_hourly (same grain, same M-14 columns), built
+      incremental so consumers stop recomputing the staging dedup + pivot over
+      the full landing table. One row per (ba, period). Each run merges a
+      trailing 10-day window of periods: revisions reach a period until it ages
+      out of eia_region's 7-day ingestion lookback (an 8-calendar-day span),
+      +2 days operational slack (M-5, applied per M-16).
+    config:
+      materialized: incremental
+      incremental_strategy: merge
+      unique_key: ['ba', 'period']
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+        data_tests: [not_null]
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: demand_mwh
+        description: Demand for the hour (MWh, metric D); null for generation-only BAs (M-14).
+      - name: demand_forecast_mwh
+        description: >
+          The grid operator's day-ahead demand forecast for the hour (MWh,
+          metric DF); null for generation-only BAs (M-14).
+      - name: net_generation_mwh
+        description: Net generation for the hour (MWh, metric NG).
+      - name: total_interchange_mwh
+        description: >
+          Total interchange for the hour (MWh, metric TI) — positive = net
+          exports to neighboring BAs.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, period]
+
+  - name: fct_demand_accuracy
+    description: >
+      Daily forecast-accuracy scorecard — grain: one row per (ba, date,
+      forecaster), LONG so Phase 4 adds forecasters as rows, never as schema
+      changes (M-15). Today's only forecaster is 'eia_df' (the operators' own
+      day-ahead demand forecast). Scores only hours where both demand and the
+      forecast are present; BA-days with nothing to score produce no row, so
+      generation-only BAs never appear. Daily metrics are ratios of the day's
+      sums, not means of hourly ratios (M-6 spirit); WAPE is primary, MAPE
+      secondary (near-zero-demand caveat, M-15). Plain table rebuilt from
+      fct_demand_hourly each run (M-5/M-16).
+    config:
+      materialized: table
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+        data_tests: [not_null]
+      - name: date
+        description: UTC calendar day of the scored periods (M-7).
+        data_tests: [not_null]
+      - name: forecaster
+        description: >
+          Who made the forecast being scored. 'eia_df' today; Phase 4 adds
+          'naive' and 'zeus_v<N>' rows (M-15).
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['eia_df']
+      - name: wape
+        description: >
+          sum(|demand − forecast|) / sum(|demand|) over the day's scored hours —
+          the primary accuracy metric (M-15). >= 0, unbounded above; null only
+          on a degenerate all-zero-demand day.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: bias_pct
+        description: >
+          sum(forecast − demand) / sum(|demand|) — signed; positive = the
+          forecaster systematically over-forecasts (M-15).
+      - name: mape
+        description: >
+          Mean over demand<>0 hours of |demand − forecast| / |demand| —
+          secondary: near-zero-demand hours inflate it, which is why WAPE is
+          primary (M-15).
+      - name: hours_scored
+        description: Hours of the day where both demand and forecast were present.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 24
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, date, forecaster]
+
   - name: fct_energy_daily
     description: >
       The cross-source daily mart: EIA generation rolled up to (ba, date) joined
@@ -53,7 +151,9 @@ models:
       tracks generation — all 71 BAs appear; weather columns are null for the
       57 BAs without coverage and inside NOAA's ~3-day publication lag.
       renewable_share is the ratio of daily sums, not the mean of hourly shares
-      (M-6). Plain table, rebuilt from fct_generation_hourly each run (M-5).
+      (M-6). Demand columns join LEFT from fct_demand_hourly — null for
+      generation-only BAs (M-14, same nullable policy as weather). Plain table,
+      rebuilt from fct_generation_hourly each run (M-5).
     config:
       materialized: table
     columns:
@@ -90,6 +190,14 @@ models:
                 min_value: 1
                 max_value: 24
                 inclusive: true
+      - name: demand_mwh
+        description: >
+          Daily sum of hourly demand (MWh) over reported hours; null for
+          generation-only BAs (M-14).
+      - name: demand_forecast_mwh
+        description: >
+          Daily sum of the operator's day-ahead hourly demand forecast (MWh);
+          null for generation-only BAs (M-14).
       - name: station_count
         description: >
           Stations behind the BA-day's weather means; null when no weather joined

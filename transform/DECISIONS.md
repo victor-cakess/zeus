@@ -470,3 +470,105 @@ The access half (role, warehouse, resource monitor, grants) lives in `ADR.md` #1
   one-line view edit to surface — the cost of an explicit contract over `select *`.
 - Another layer to keep in mind when reasoning about lineage, though it adds zero
   business logic.
+
+---
+
+## M-14. EIA region data pivots to wide at intermediate; nulls stay null
+
+**Chosen:** `int_eia_region__demand_hourly` reshapes the staging narrow grain
+`(ba, period, metric)` to one row per `(ba, period)` with the four metrics as
+columns: `demand_mwh` (D), `demand_forecast_mwh` (DF), `net_generation_mwh` (NG),
+`total_interchange_mwh` (TI). Missing metrics stay **null** — generation-only BAs
+(e.g. YAD) never report D/DF; that absence is real data shape, not a defect to
+impute or filter. Hourly grain preserved (aggregate late, M-0). `TI` keeps EIA's
+sign convention: positive = net exports.
+
+**Alternatives considered:**
+- **Stay narrow through the marts** — every consumer (accuracy metrics, energy
+  balance, ML features) needs D and DF side by side; narrow forces the same
+  self-join/pivot into every downstream query.
+- **Pivot in staging** — staging is cleaning only (dedup + rename); a reshape is a
+  judgment call and belongs in intermediate by the layering contract.
+- **Fill missing D/DF with 0 or drop those BAs** — fabricates demand where none is
+  reported, and hides which BAs are demand-reporting (a fact downstream models
+  key on).
+
+**Why:**
+- One pivot, written once, materialized once (M-16) — consumers read columns.
+- Null-preservation keeps "which BAs report demand" answerable from the model
+  itself (M-11 spirit: missingness is signal).
+
+**Trade-offs:**
+- A future fifth region-data metric is a model change (new column), not free the
+  way a narrow schema would make it. The route has published exactly these four
+  for years; taking the ergonomics today.
+
+---
+
+## M-15. Forecast accuracy: long grain with a forecaster dimension; WAPE primary
+
+**Chosen:** `fct_demand_accuracy` grain is `(ba, date, forecaster)` — **long**.
+Today the single forecaster is `eia_df` (the operators' own day-ahead demand
+forecast); Phase 4's ML loop adds `naive` and `zeus_v<N>` as **rows**, with zero
+schema change. Metrics per BA-day, computed only over hours where both demand and
+forecast are present (`hours_scored` counts them; BA-days with nothing to score
+emit no row):
+- `wape` = Σ|D−DF| / Σ|D| — **primary**: ratio of the day's sums (M-6 spirit),
+  robust to near-zero-demand hours.
+- `bias_pct` = Σ(DF−D) / Σ|D| — signed; positive = systematic over-forecasting.
+- `mape` — secondary, kept for familiarity: mean of hourly |D−DF|/|D| over D≠0
+  hours; near-zero-demand hours inflate it, which is exactly why WAPE is primary.
+
+**Alternatives considered:**
+- **Wide grain `(ba, date)` with per-forecaster columns** — simpler today, but
+  every new forecaster is a schema migration and an incremental-CI headache;
+  the roadmap's Phase 4 makes new forecasters a certainty, not a maybe.
+- **MAPE as primary** — the textbook default, but hourly demand crosses near zero
+  for small/storage-heavy BAs, where MAPE explodes; WAPE degrades gracefully.
+- **Scoring all hours, treating missing DF as error** — conflates "operator
+  didn't publish a forecast" with "operator forecast badly".
+
+**Why:**
+- Long is Phase-4-proof: the scorecard becomes the shared arena by INSERT, not
+  ALTER.
+- Ratio-of-sums daily metrics follow the established M-6 rule.
+
+**Trade-offs:**
+- Single-forecaster queries need a `where forecaster = 'eia_df'` filter today.
+- `accepted_values` on `forecaster` must be extended when Phase 4 adds rows —
+  deliberate: a new forecaster should be a conscious contract change.
+
+---
+
+## M-16. Phase-3 materialization: M-5 applied; no Snowflake MVs or dynamic tables
+
+**Chosen:** the roadmap's materialization policy, applied to the Phase-3 models
+as instances of M-5 — `fct_demand_hourly` is **incremental** (merge on
+`(ba, period)`, trailing 10-day window: eia_region shares the 7-day ingestion
+lookback, so the same 8-day revision span + 2 days slack applies);
+`fct_demand_accuracy` is a **plain table** rebuilt from the materialized hourly
+fact; the intermediate pivot stays a view. Also recording the standing rejection:
+**no Snowflake materialized views, no dynamic tables** anywhere in the project.
+
+**Alternatives considered:**
+- **Snowflake materialized views** — can't express the staging dedup or the pivot
+  (no window functions; Enterprise-only feature).
+- **Dynamic tables** — mechanically workable, but `TARGET_LAG` is a second
+  freshness scheduler competing with the state machine; the platform's core
+  design is one orchestrator owning "when things run", and refresh timing must
+  not leak out of it.
+- **Incremental accuracy mart** — a small daily-grain aggregate over an
+  already-materialized fact; incremental machinery without payoff (M-5's
+  daily-mart argument verbatim).
+
+**Why:**
+- Same revision horizon ⇒ same window arithmetic; one rule to remember, derived
+  from the lookback in both places.
+- dbt-owned materialization keeps every refresh visible in the run report and
+  the digest — a dynamic table refreshing on its own clock would not be.
+
+**Trade-offs:**
+- `--full-refresh` discipline for `fct_demand_hourly` on schema/logic changes
+  (same as M-5).
+- If the eia_region lookback ever diverges from EIA's 7 days, the 10-day window
+  here must be revisited independently.
