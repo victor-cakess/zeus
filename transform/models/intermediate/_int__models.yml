@@ -38,6 +38,39 @@ models:
           arguments:
             combination_of_columns: [ba, period]
 
+  - name: int_eia_region__demand_hourly
+    description: >
+      EIA region data pivoted from (ba, period, metric) narrow to one row per
+      (ba, period) wide: demand (D), the operator's day-ahead demand forecast
+      (DF), net generation (NG), and total interchange (TI) as columns (M-14).
+      Hourly grain preserved (aggregate late). Nulls stay null — generation-only
+      BAs never report D/DF; missingness is signal (M-11 spirit).
+    columns:
+      - name: ba
+        description: Balancing-authority code. Join key to EIA generation / NOAA weather.
+        data_tests: [not_null]
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: demand_mwh
+        description: >
+          Demand for the hour (MWh, metric D); null for generation-only BAs
+          (expected data shape, not an error).
+      - name: demand_forecast_mwh
+        description: >
+          The grid operator's day-ahead demand forecast for the hour (MWh,
+          metric DF); null for generation-only BAs.
+      - name: net_generation_mwh
+        description: Net generation for the hour (MWh, metric NG).
+      - name: total_interchange_mwh
+        description: >
+          Total interchange for the hour (MWh, metric TI) — EIA sign convention:
+          positive = net exports to neighboring BAs.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, period]
+
   - name: int_noaa__weather_daily
     description: >
       NOAA weather aggregated to (ba, observation_date) as the areal mean across the

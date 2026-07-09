@@ -57,7 +57,7 @@ How code ships (distinct from the runtime view above). dbt/transform PRs are fir
 
 ### Data model
 
-Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). The only cross-source join in the pipeline is EIA generation ↔ NOAA weather inside `fct_energy_daily`, on `(ba, date)` (M-4) — EIA and NOAA are deliberately keyed on the same balancing-authority code so this join works. `fct_fuel_prices_daily` (FRED) is **standalone** — national (no `ba`), not joined to the other marts; a consumer *can* join it to `fct_energy_daily` on `date`, but the pipeline doesn't (M-12). Grains are the `PK` columns. `EIA_REGION_GRID` (hourly demand / day-ahead demand forecast / net generation / total interchange) is landing + staging only for now — its intermediate/mart layers (forecast accuracy, energy balance) come next, so it appears unconnected here.
+Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). The cross-source joins in the pipeline live inside `fct_energy_daily`, both LEFT on `(ba, date)`: EIA generation ↔ NOAA weather (M-4) and ↔ EIA-region demand (M-14) — the sources are deliberately keyed on the same balancing-authority code so these joins work. `fct_demand_accuracy` scores the operators' day-ahead forecast against actual demand per BA-day, long on a `forecaster` dimension (M-15). `fct_fuel_prices_daily` (FRED) is **standalone** — national (no `ba`), not joined to the other marts; a consumer *can* join it to `fct_energy_daily` on `date`, but the pipeline doesn't (M-12). Grains are the `PK` columns.
 
 ```mermaid
 erDiagram
@@ -95,6 +95,14 @@ erDiagram
         float renewable_gross_mwh
         float renewable_share "0..1 (M-1)"
     }
+    INT_EIA_REGION__DEMAND_HOURLY {
+        string ba PK
+        timestamp period PK
+        float demand_mwh "D (null for gen-only BAs, M-14)"
+        float demand_forecast_mwh "DF"
+        float net_generation_mwh "NG"
+        float total_interchange_mwh "TI (signed)"
+    }
     INT_NOAA__WEATHER_DAILY {
         string ba PK "join key"
         date observation_date PK "join key"
@@ -112,11 +120,29 @@ erDiagram
         float total_gross_mwh
         float renewable_share
     }
+    FCT_DEMAND_HOURLY {
+        string ba PK
+        timestamp period PK
+        float demand_mwh
+        float demand_forecast_mwh
+        float net_generation_mwh
+        float total_interchange_mwh
+    }
+    FCT_DEMAND_ACCURACY {
+        string ba PK
+        date date PK
+        string forecaster PK "eia_df (long, M-15)"
+        float wape "primary"
+        float bias_pct "signed"
+        int hours_scored
+    }
     FCT_ENERGY_DAILY {
         string ba PK "join key"
         date date PK "join key"
         float renewable_share
         int hours_reported "24 = complete"
+        float demand_mwh "nullable (M-14)"
+        float demand_forecast_mwh "nullable (M-14)"
         float weather_cols "13 BA-mean cols (nullable, M-4)"
     }
     FCT_FUEL_PRICES_DAILY {
@@ -125,6 +151,10 @@ erDiagram
     }
 
     EIA_GRID }o--|| INT_EIA__GENERATION_HOURLY : "stg dedup + rules (M-1/M-2)"
+    EIA_REGION_GRID }o--|| INT_EIA_REGION__DEMAND_HOURLY : "stg dedup + pivot D/DF/NG/TI (M-14)"
+    INT_EIA_REGION__DEMAND_HOURLY ||--|| FCT_DEMAND_HOURLY : "materialize incremental (M-5/M-16)"
+    FCT_DEMAND_HOURLY }o--|| FCT_DEMAND_ACCURACY : "score DF vs D per BA-day (M-15)"
+    FCT_DEMAND_HOURLY }o--o| FCT_ENERGY_DAILY : "LEFT JOIN daily sums on (ba, date)"
     NOAA_GRID }o--|| INT_NOAA__WEATHER_DAILY : "station -> BA mean, daily (M-3)"
     FRED_GRID }o--|| INT_FRED__PRICES_DAILY : "wide daily LOCF spine (M-10)"
     INT_EIA__GENERATION_HOURLY ||--|| FCT_GENERATION_HOURLY : "materialize incremental (M-5)"
@@ -150,7 +180,7 @@ erDiagram
 ## Project status
 
 - **Ingestion (live):** EIA (71 balancing authorities), EIA region-data (same 71 BAs — hourly demand, day-ahead demand forecast, net generation, interchange; shares the EIA API key), NOAA (14 BAs → weather stations), FRED (15 national price series). Each daily, fault-tolerant per unit.
-- **Modeling (live):** dbt — **13 models** (4 staging + 3 intermediate + 3 marts + 3 reporting views), **58 tests**. The region-data intermediate/mart layers (forecast accuracy, energy balance) come next.
+- **Modeling (live):** dbt — **16 models** (4 staging + 4 intermediate + 5 marts + 3 reporting views), **71 tests**. Includes the demand/forecast-accuracy layer over region-data (`fct_demand_hourly`, `fct_demand_accuracy` — WAPE/bias per BA-day); the energy-balance test and interchange analytics come next.
 - **Orchestration (live):** one Step Functions state machine on a 07:00 UTC daily cron; the digest always runs, any failure alerts via SNS and marks the execution Failed.
 - **CI/CD (live):** offline gates (gitleaks + `dbt parse` + an offline Lambda unit suite (`pytest`) + `terraform fmt/validate`), a zero-copy clone CI for dbt PRs, and a decoupled dbt-image CD via GitHub OIDC.
 - **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a Streamlit dashboard ([`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)).
