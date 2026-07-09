@@ -225,7 +225,7 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 
 - **Worker detail:** image in ECR repo `zeus-dev-dbt-run`, tag = commit SHA, built + deployed by CI on merge to dev (Phase 2.5); the Terraform root provisions the Lambda/ECR but ignores `image_uri`; 2048 MB, 300 s. The image bakes `transform/` + `dbt deps` at build time; the handler runs `dbt build` (models + tests) via `dbtRunner`, authenticating as `ZEUS_DEV_TRANSFORMER` (key-pair; private key SSM `/zeus/dev/snowflake/transformer_private_key`, fetched to `/tmp` per run).
 - **Lambda runtime gotchas (isolated in `src/lambdas/dbt/lambda_mp_patch.py`, rationale in its docstring; the handler calls `apply()`):** Lambda has **no `/dev/shm`**, so multiprocessing SemLocks raise `FileNotFoundError` — `apply()` swaps dbt's mp context for `multiprocessing.dummy` **before** the `dbt.cli` import (Manifest binds the lock factory at class-definition time) and replaces ThreadPool's SemLock-backed change notifier with an `os.pipe()` shim. The image is read-only → `HOME` and dbt's target/log paths are redirected to `/tmp`.
-- **Observed performance:** ~23 s per run measured at 9 models/52 tests — the suite is now 16 models / 71 tests; re-measure at the next CD smoke-invoke. Image cold-start init ~3.8 s, peak memory ~273 MB (of 2048).
+- **Observed performance:** ~47 s per run (16 models, 71 tests — includes the incremental merge over `fct_demand_hourly` and the accuracy/daily-mart rebuilds; July 2026 CD smoke-invoke). Image cold-start init ~3.1 s, peak memory ~298 MB (of 2048).
 
 ### Daily digest
 
