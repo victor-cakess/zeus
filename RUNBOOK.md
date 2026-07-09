@@ -154,7 +154,7 @@ aws stepfunctions describe-execution --execution-arn <arn from above>
 uv run python backfill/eia/run.py  extract   --start 2017-01-01       # then: transform, then snowflake_load.py
 EIA_API_KEY=$(aws ssm get-parameter --name /zeus/dev/eia/api_key --with-decryption \
   --query Parameter.Value --output text) \
-  uv run python backfill/eia_region/run.py extract --start 2015-07-01 # EIA-930 demand begins 2015-07; then: transform, then snowflake_load.py (sf_eia_region_loader.p8)
+  uv run python backfill/eia_region/run.py extract --start 2019-01-01 # region-data API route serves 2019-01-01→ (route startPeriod; pre-2019 EIA-930 is bulk-CSV only); then: transform, then snowflake_load.py (sf_eia_region_loader.p8)
 uv run python backfill/noaa/run.py extract   --start 2010-01-01       # one batched request per BA-year
 uv run python backfill/noaa/run.py transform --start 2010-01-01       # per-day curated Parquet (S3-only, parallel)
 SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \

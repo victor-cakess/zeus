@@ -42,6 +42,7 @@ with Diagram(
         with Cluster("Ingest (parallel)"):
             ingest = [
                 Lambda("EIA\nhourly fuel-type"),
+                Lambda("EIA region\ndemand + DA forecast"),
                 Lambda("NOAA\ndaily weather"),
                 Lambda("FRED\nenergy prices"),
             ]
@@ -50,7 +51,7 @@ with Diagram(
         digest = Lambda("digest\n(always runs)")
 
     s3 = S3("S3\nraw / curated / reports")
-    landing = Snowflake("Snowflake landing\nEIA / NOAA / FRED _GRID")
+    landing = Snowflake("Snowflake landing\nEIA / EIA_REGION /\nNOAA / FRED _GRID")
     marts = Snowflake("Snowflake marts\nfct_* tables")
     sns = SimpleNotificationServiceSns("SNS\nemail digest + alerts")
 

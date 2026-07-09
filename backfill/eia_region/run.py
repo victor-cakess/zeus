@@ -1,11 +1,12 @@
 """CLI entry point for the EIA region-data (D/DF/NG/TI) historical backfill.
 
-    uv run python run.py extract   --start 2015-07-01 [--end YYYY-MM-DD] [--concurrency N]
-    uv run python run.py transform --start 2015-07-01 [--end YYYY-MM-DD] [--concurrency N]
+    uv run python run.py extract   --start 2019-01-01 [--end YYYY-MM-DD] [--concurrency N]
+    uv run python run.py transform --start 2019-01-01 [--end YYYY-MM-DD] [--concurrency N]
 
-EIA-930 hourly demand begins 2015-07-01; DF/TI coverage starts later per BA —
-empty (BA, year) ranges are logged and skipped, so starting at 2015-07-01 is safe
-for the whole units list.
+The v2 API route serves data from 2019-01-01 only (its startPeriod, verified via
+route metadata 2026-07-09) — EIA-930's earlier 2015-2018 history exists solely as
+bulk CSV downloads, not through this route. Empty (BA, year) ranges are logged and
+skipped, so an earlier --start is safe, just wasted probes.
 
 Config via env: EIA_API_KEY (required for extract; same key as the fuel-type
 backfill), BUCKET (default zeus-dev-energy-data), SOURCE (default eia_region).
