@@ -59,7 +59,7 @@ transform/                        # dbt project (staging + intermediate + marts 
 extraction/                       # gitignored, exploratory notebooks
 backfill/                         # one-off historical backfill scripts (reuse src/ via _bootstrap.py); see backfill/README.md
   eia/                            # fetch→raw→curated→COPY: run.py (extract/transform) + fetch.py + extract.py + transform.py + snowflake_load.py + units.py (BA list) + _bootstrap.py + logconf.py
-  eia_region/                     # same two-phase pattern (clone of eia/, region-data route); history starts 2015-07-01 (EIA-930 demand)
+  eia_region/                     # same two-phase pattern (clone of eia/, region-data route); API history starts 2019-01-01 (route startPeriod — pre-2019 EIA-930 is bulk-CSV only)
   noaa/                           # same two-phase pattern (run.py/fetch/extract/transform/snowflake_load + _bootstrap + logconf; stations from src client, no units.py); day-partitioned, backdated, idempotent resume
   fred/                           # same two-phase pattern (series from src client's SERIES map); one request per series for the whole range, FRED_API_KEY env for extract; backfilled 2014→2026
 README.md                         # project overview + diagrams + how to run (front door)
