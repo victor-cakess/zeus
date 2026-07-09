@@ -1,6 +1,6 @@
 # Zeus
 
-A serverless **energy-data platform** on AWS + Snowflake. One Step Functions state machine runs the whole daily flow: three ingestion pipelines — **EIA** (hourly fuel-type generation), **NOAA** (daily weather summaries), and **FRED** (national energy prices) — run in parallel, each landing raw JSON + a curated Parquet in S3 and `COPY`ing it into a Snowflake landing table; a **dbt** container-image Lambda then builds and tests the modeled layers (staging → intermediate → marts); finally a **digest** Lambda emails one combined run-report across all sources plus the dbt run. The digest always runs, even when an upstream step fails.
+A serverless **energy-data platform** on AWS + Snowflake. One Step Functions state machine runs the whole daily flow: four ingestion pipelines — **EIA** (hourly fuel-type generation), **EIA region** (hourly demand, day-ahead demand forecast, net generation, and interchange per balancing authority), **NOAA** (daily weather summaries), and **FRED** (national energy prices) — run in parallel, each landing raw JSON + a curated Parquet in S3 and `COPY`ing it into a Snowflake landing table; a **dbt** container-image Lambda then builds and tests the modeled layers (staging → intermediate → marts); finally a **digest** Lambda emails one combined run-report across all sources plus the dbt run. The digest always runs, even when an upstream step fails.
 
 EIA and NOAA are deliberately keyed on the same balancing-authority codes (`ba`) so weather joins to generation in the marts; FRED prices are national and land as a standalone mart (a consumer can join them on `date`).
 
@@ -24,6 +24,7 @@ flowchart TB
         subgraph ingest["Ingest (parallel)"]
             direction LR
             eia["EIA Lambda<br/>hourly fuel-type"]
+            eiar["EIA region Lambda<br/>demand + DA forecast"]
             noaa["NOAA Lambda<br/>daily weather"]
             fred["FRED Lambda<br/>energy prices"]
         end
@@ -33,9 +34,10 @@ flowchart TB
     end
 
     eia -->|raw JSON + curated Parquet| s3[("S3<br/>raw/ · curated/ · reports/")]
+    eiar --> s3
     noaa --> s3
     fred --> s3
-    s3 -->|COPY INTO| sf[("Snowflake landing<br/>EIA_GRID · NOAA_GRID · FRED_GRID")]
+    s3 -->|COPY INTO| sf[("Snowflake landing<br/>EIA_GRID · EIA_REGION_GRID · NOAA_GRID · FRED_GRID")]
     sf -->|read| dbt
     dbt -->|staging → intermediate → marts| marts[("Snowflake marts<br/>fct_* tables")]
 
@@ -140,12 +142,12 @@ erDiagram
 
 ## Project status
 
-- **Ingestion (live):** EIA (71 balancing authorities), NOAA (14 BAs → weather stations), FRED (15 national price series). Each daily, fault-tolerant per unit.
-- **Modeling (live):** dbt — **12 models** (3 staging + 3 intermediate + 3 marts + 3 reporting views), **52 tests**.
+- **Ingestion (live):** EIA (71 balancing authorities), EIA region-data (same 71 BAs — hourly demand, day-ahead demand forecast, net generation, interchange; shares the EIA API key), NOAA (14 BAs → weather stations), FRED (15 national price series). Each daily, fault-tolerant per unit.
+- **Modeling (live):** dbt — **13 models** (4 staging + 3 intermediate + 3 marts + 3 reporting views), **58 tests**. The region-data intermediate/mart layers (forecast accuracy, energy balance) come next.
 - **Orchestration (live):** one Step Functions state machine on a 07:00 UTC daily cron; the digest always runs, any failure alerts via SNS and marks the execution Failed.
 - **CI/CD (live):** offline gates (gitleaks + `dbt parse` + an offline Lambda unit suite (`pytest`) + `terraform fmt/validate`), a zero-copy clone CI for dbt PRs, and a decoupled dbt-image CD via GitHub OIDC.
 - **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a Streamlit dashboard ([`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)).
-- **History:** all three sources backfilled (EIA 2017→, NOAA 2010→, FRED 2014→).
+- **History:** EIA 2017→, NOAA 2010→, FRED 2014→ backfilled; EIA region-data backfill (2015-07→, EIA-930 demand history) scripted in `backfill/eia_region/`, runs at deploy.
 
 ## Repository layout
 

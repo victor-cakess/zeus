@@ -1,0 +1,17 @@
+version: 2
+
+sources:
+  - name: eia_region
+    database: "{{ target.database }}"
+    schema: EIA_REGION
+    description: >
+      EIA hourly region-data landing (demand, day-ahead demand forecast, net
+      generation, total interchange), loaded by the zeus-dev-eia-region-ingest
+      Lambda's COPY INTO.
+    tables:
+      - name: eia_region_grid
+        description: >
+          Append-only EIA region-data landing table. One row per
+          (respondent, period, type), type in (D, DF, NG, TI). Duplicates from the
+          rolling 7-day lookback overlap are removed in stg_eia_region__grid
+          (keep latest ingestion_date).

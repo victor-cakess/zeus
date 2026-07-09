@@ -12,6 +12,13 @@ data "terraform_remote_state" "eia" {
   }
 }
 
+data "terraform_remote_state" "eia_region" {
+  backend = "local"
+  config = {
+    path = "${path.module}/../eia_region/terraform.tfstate"
+  }
+}
+
 data "terraform_remote_state" "noaa" {
   backend = "local"
   config = {

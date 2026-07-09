@@ -552,6 +552,42 @@ Observed performance numbers (duration, memory, cold start) live in [RUNBOOK.md]
 
 ---
 
+## EIA region-data pipeline
+
+Pulls the EIA v2 RTO `region-data` route — hourly **Demand (D)**, **Day-ahead demand forecast (DF)**, **Net generation (NG)**, and **Total interchange (TI)** per balancing authority — as the platform's fourth source (`eia_region`), landing in `ZEUS_DEV.EIA_REGION.EIA_REGION_GRID`. Same API, key, respondent codes, and pipeline shape as the EIA fuel-type source; only the genuinely source-specific decisions are recorded here. (DF is the benchmark the planned forecast-accuracy work — and a later ML act — will score against.)
+
+### EIA-REGION-1. A fourth source, not a second route inside the EIA Lambda
+
+**Chosen:** `region-data` is onboarded as its own source slug (`eia_region`): own Lambda (`zeus-dev-eia-region-ingest`), S3 prefixes (`raw/eia_region/` …), landing schema/table/stage/loader, pipeline root, state-machine branch, and digest entry.
+
+**Alternatives considered:**
+- **Fetching both routes in the existing EIA Lambda.** Rejected: the whole platform rests on a 1:1 contract — one source → one landing table → one curated Parquet/day → one run report → one branch with its own failure normalization. A second route inside one invocation means either two COPY targets + a merged report (breaking `run_ingest`'s shape for every source) or mixing two grains in one table. It also couples failure domains: a region-data outage would fail the healthy fuel-type ingest.
+- **Renaming `eia` → `eia_fuel_type` for symmetry.** Rejected: S3 is append-only/immutable and every downstream name derives from the slug; a rename is a migration with zero functional gain.
+
+**Why:** zero new platform primitives — the fourth stamp of the existing pattern. The naming asymmetry (`eia` retroactively means "the EIA *fuel-type* dataset") is documented here and accepted.
+
+### EIA-REGION-2. One request-loop per BA returns all four series; narrow landing grain
+
+**Chosen:** the client omits the `type` facet, so each per-BA fetch returns D/DF/NG/TI together; grain is `(period, respondent, type)`, narrow, mirroring the raw API shape (`type` is a column, not a fan-out unit). Staging (`stg_eia_region__grid`) dedups on that grain keep-latest-`ingestion_date`; the wide D/DF/NG/TI pivot is intermediate-layer work, deliberately deferred.
+
+**Alternatives considered:**
+- **Fan-out unit = (BA, type)** — 284 units for no isolation benefit (the four series come from one endpoint; they fail together), 4× the raw files, and a broken 1-unit-=-1-raw-file convention.
+- **Pivoting wide at ingestion** — judgment (null semantics for missing series) doesn't belong in a Lambda; landing mirrors truth-as-received (same policy as every source).
+
+**Why:** ~4× fewer requests, the raw file mirrors the API exactly, and per-unit fault tolerance stays per-BA. Generation-only BAs may legitimately return no D/DF rows — that's data shape, not failure; completeness across series is deliberately not asserted at staging.
+
+### EIA-REGION-3. Shared EIA API key with a single Terraform owner; BA list deliberately duplicated
+
+**Chosen:** the Lambda reads the same SSM parameter (`/zeus/dev/eia/api_key`). The **eia root keeps sole Terraform ownership** of the parameter; the eia_region root consumes the path as a string and constructs the ARN for IAM (no `aws_ssm_parameter` data source — it would pull the SecureString value into state). The 71-BA unit list is **duplicated** into `infra/pipelines/eia_region/locals.tf` rather than read from the eia root's remote state.
+
+**Alternatives considered:**
+- **Re-authoring the SSM parameter in both roots** — two owners of one secret; either apply could clobber or delete it for the other.
+- **Reading the BA list via `terraform_remote_state` from the eia root** — couples apply order to a sibling for a value that may legitimately diverge: the fuel-type list pruned 10 permanently *generation*-empty BAs, a judgment that doesn't automatically transfer to demand data.
+
+**Why:** one owner per secret is the same rule the platform applies everywhere; self-contained roots was the explicit design goal of decision 2. Rate-limit note: both EIA Lambdas run in the same Parallel state against one key — combined ~150 requests/run vs EIA's published 5,000/hr default — comfortable; revisit if a third EIA route lands (which is also the trigger to extract a shared EIA client, per the rule of three).
+
+---
+
 ## NOAA pipeline
 
 Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-summaries`) for weather stations grouped under 14 balancing authorities (`CISO, PJM, ERCO, MISO, ISNE, NYIS, SWPP, TVA, SOCO, DUK, FPL, BPAT, PSCO, SRP`; 3–10 stations each), daily. Mirrors the EIA pipeline's shape; only the genuinely source-specific decisions are recorded here.
