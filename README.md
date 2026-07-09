@@ -57,7 +57,7 @@ How code ships (distinct from the runtime view above). dbt/transform PRs are fir
 
 ### Data model
 
-Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). The only cross-source join in the pipeline is EIA generation ↔ NOAA weather inside `fct_energy_daily`, on `(ba, date)` (M-4) — EIA and NOAA are deliberately keyed on the same balancing-authority code so this join works. `fct_fuel_prices_daily` (FRED) is **standalone** — national (no `ba`), not joined to the other marts; a consumer *can* join it to `fct_energy_daily` on `date`, but the pipeline doesn't (M-12). Grains are the `PK` columns.
+Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). The only cross-source join in the pipeline is EIA generation ↔ NOAA weather inside `fct_energy_daily`, on `(ba, date)` (M-4) — EIA and NOAA are deliberately keyed on the same balancing-authority code so this join works. `fct_fuel_prices_daily` (FRED) is **standalone** — national (no `ba`), not joined to the other marts; a consumer *can* join it to `fct_energy_daily` on `date`, but the pipeline doesn't (M-12). Grains are the `PK` columns. `EIA_REGION_GRID` (hourly demand / day-ahead demand forecast / net generation / total interchange) is landing + staging only for now — its intermediate/mart layers (forecast accuracy, energy balance) come next, so it appears unconnected here.
 
 ```mermaid
 erDiagram
@@ -66,6 +66,13 @@ erDiagram
         string respondent "balancing authority"
         string fueltype
         float value "MWh"
+        date ingestion_date
+    }
+    EIA_REGION_GRID {
+        timestamp period "hour, UTC"
+        string respondent "balancing authority"
+        string type "D / DF / NG / TI"
+        float value "MWh (TI signed)"
         date ingestion_date
     }
     NOAA_GRID {
