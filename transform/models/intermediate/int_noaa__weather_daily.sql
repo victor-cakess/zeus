@@ -34,4 +34,12 @@ aggregated as (
     group by ba, observation_date
 )
 
-select * from aggregated
+select
+    *,
+    -- degree days, base 65°F over the derived tavg (DECISIONS.md M-17): US
+    -- industry convention is °F-days, our temps are °C, so convert inline.
+    -- greatest(null, 0) is null in Snowflake, so days without tavg stay
+    -- honestly null (M-4 policy downstream).
+    greatest(65 - (tavg * 9 / 5 + 32), 0) as hdd,
+    greatest((tavg * 9 / 5 + 32) - 65, 0) as cdd
+from aggregated

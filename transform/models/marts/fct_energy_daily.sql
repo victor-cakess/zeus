@@ -58,7 +58,9 @@ select
     w.wsf5,
     w.rhav,
     w.aslp,
-    w.adpt
+    w.adpt,
+    w.hdd,
+    w.cdd
 from generation_daily g
 left join demand_daily d
     on g.ba = d.ba

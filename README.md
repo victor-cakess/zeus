@@ -108,6 +108,8 @@ erDiagram
         date observation_date PK "join key"
         int station_count
         float weather_cols "13 BA-mean cols (M-3)"
+        float hdd "heating degree days, base 65F (M-17)"
+        float cdd "cooling degree days, base 65F (M-17)"
     }
     INT_FRED__PRICES_DAILY {
         date date PK
@@ -144,6 +146,8 @@ erDiagram
         float demand_mwh "nullable (M-14)"
         float demand_forecast_mwh "nullable (M-14)"
         float weather_cols "13 BA-mean cols (nullable, M-4)"
+        float hdd "degree days, base 65F (M-17, nullable)"
+        float cdd "degree days, base 65F (M-17, nullable)"
     }
     FCT_FUEL_PRICES_DAILY {
         date date PK
@@ -180,7 +184,7 @@ erDiagram
 ## Project status
 
 - **Ingestion (live):** EIA (71 balancing authorities), EIA region-data (same 71 BAs — hourly demand, day-ahead demand forecast, net generation, interchange; shares the EIA API key), NOAA (14 BAs → weather stations), FRED (15 national price series). Each daily, fault-tolerant per unit.
-- **Modeling (live):** dbt — **16 models** (4 staging + 4 intermediate + 5 marts + 3 reporting views), **71 tests**. Includes the demand/forecast-accuracy layer over region-data (`fct_demand_hourly`, `fct_demand_accuracy` — WAPE/bias per BA-day); the energy-balance test and interchange analytics come next.
+- **Modeling (live):** dbt — **16 models** (4 staging + 4 intermediate + 5 marts + 3 reporting views), **73 tests**. Includes the demand/forecast-accuracy layer over region-data (`fct_demand_hourly`, `fct_demand_accuracy` — WAPE/bias per BA-day) and base-65°F degree days (`hdd`/`cdd`) on `fct_energy_daily`; the energy-balance test and interchange analytics come next.
 - **Orchestration (live):** one Step Functions state machine on a 07:00 UTC daily cron; the digest always runs, any failure alerts via SNS and marks the execution Failed.
 - **CI/CD (live):** offline gates (gitleaks + `dbt parse` + an offline Lambda unit suite (`pytest`) + `terraform fmt/validate`), a zero-copy clone CI for dbt PRs, and a decoupled dbt-image CD via GitHub OIDC.
 - **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a Streamlit dashboard ([`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)).
