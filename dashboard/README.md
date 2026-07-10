@@ -58,7 +58,7 @@ dashboard identity above, so nothing else is required. See RUNBOOK.md → dashbo
 ## What it shows
 
 **Generation tab**
-- **Daily generation** — `vw_energy_daily`, net MWh + renewable share over the date range.
+- **Renewable share** — `vw_energy_daily`, daily share of gross generation from solar + wind + hydro (ratio of sums, M-6): the decarbonization trend and seasonal rhythm.
 - **Intraday profile — the duck curve** — `vw_generation_hourly`, average generation by hour of day (UTC): the midday renewable hump and evening net-load ramp.
 
 **Weather tab** (own season + year picker)
@@ -66,8 +66,7 @@ dashboard identity above, so nothing else is required. See RUNBOOK.md → dashbo
 - **Expected vs. actual** — least-squares baseline from the prior-day relationship, plotted **by day of season** so each selected year is one continuous overlaid curve (solid = actual, dashed = expected), + a table of the days generation deviated most from what temperature predicted. A scenario baseline (explains the past), not a forecast.
 
 **Prices tab**
-- **National fuel & energy prices** — `vw_fuel_prices_daily`, pick any FRED series.
-- **Price ↔ demand** — FRED price (national, `vw_fuel_prices_daily`) ⨝ EIA demand (per-BA net MWh, `vw_energy_daily`) on `date`, dual-axis: does demand track the price or move independently?
+- **National energy prices, indexed to 100** — `vw_fuel_prices_daily`, up to 6 FRED series indexed to 100 at the range start: units differ wildly ($/bbl vs $/MMBtu vs PPI points), so relative moves on one honest axis are the comparable signal. (Replaced a raw-units multiselect and a dual-axis price↔demand chart — dual axes mislead, and raw heterogeneous units flatten the small-unit series.)
 
 **Operators tab** (forecast accuracy — Phase 3a's marts)
 - **League table** — `vw_demand_accuracy`, mean daily WAPE of each operator's own day-ahead demand forecast over the selected range, best first (sorted bar + full table). Only demand-reporting BAs appear (generation-only BAs publish no D/DF); partial days (`hours_scored < 23`) excluded.
