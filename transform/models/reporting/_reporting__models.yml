@@ -23,6 +23,10 @@ models:
         description: Ratio of daily sums (M-6); null when the day produced no gross generation.
       - name: hours_reported
         description: Distinct generation hours behind the BA-day (24 = complete).
+      - name: demand_mwh
+        description: Daily sum of hourly demand (MWh); null for generation-only BAs (M-14).
+      - name: demand_forecast_mwh
+        description: Daily sum of the operator's day-ahead demand forecast (MWh); nullable (M-14).
       - name: station_count
         description: Stations behind the BA-day's weather means; null when no weather joined (M-4).
       - name: tmax
@@ -49,6 +53,50 @@ models:
         description: BA-mean sea-level pressure (hPa); nullable (M-3/M-4).
       - name: adpt
         description: BA-mean dew point (°C); nullable (M-3/M-4).
+      - name: hdd
+        description: Heating degree days (°F-days, base 65°F — M-17); nullable (M-4).
+      - name: cdd
+        description: Cooling degree days (°F-days, base 65°F — M-17); nullable (M-4).
+
+  - name: vw_demand_accuracy
+    description: >
+      Public-serving view over fct_demand_accuracy (the dashboard Operators tab).
+      1:1 pass-through; one row per (ba, date, forecaster) — long, so Phase 4's
+      forecasters appear as rows with no view change (M-15). Only demand-reporting
+      BAs appear (64 of 71).
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+      - name: date
+        description: UTC calendar day of the scored periods (M-7).
+      - name: forecaster
+        description: Who made the forecast being scored ('eia_df' today; M-15).
+      - name: wape
+        description: sum(|D − DF|) / sum(|D|) over the day's scored hours — primary (M-15).
+      - name: bias_pct
+        description: sum(DF − D) / sum(|D|) — signed; positive = over-forecast (M-15).
+      - name: mape
+        description: Mean hourly |D − DF| / |D| over D≠0 hours — secondary (M-15).
+      - name: hours_scored
+        description: Hours of the day where both demand and forecast were present.
+
+  - name: vw_demand_hourly
+    description: >
+      Public-serving view over fct_demand_hourly. 1:1 pass-through; one row per
+      (ba, period), period in UTC (M-7); D/DF null for generation-only BAs (M-14).
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+      - name: demand_mwh
+        description: Demand for the hour (MWh, metric D); nullable (M-14).
+      - name: demand_forecast_mwh
+        description: Operator day-ahead demand forecast (MWh, metric DF); nullable (M-14).
+      - name: net_generation_mwh
+        description: Net generation for the hour (MWh, metric NG).
+      - name: total_interchange_mwh
+        description: Total interchange (MWh, metric TI) — positive = net exports.
 
   - name: vw_generation_hourly
     description: >

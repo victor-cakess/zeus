@@ -14,6 +14,8 @@ select
     renewable_gross_mwh,
     renewable_share,
     hours_reported,
+    demand_mwh,
+    demand_forecast_mwh,
     station_count,
     tmax,
     tmin,
@@ -26,5 +28,7 @@ select
     wsf5,
     rhav,
     aslp,
-    adpt
+    adpt,
+    hdd,
+    cdd
 from {{ ref('fct_energy_daily') }}
