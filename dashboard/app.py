@@ -28,6 +28,11 @@ from cryptography.hazmat.primitives import serialization
 
 st.set_page_config(page_title="Zeus — energy data", layout="wide")
 
+# Altair caps embedded data at 5000 rows by default; the generation-mix stacked area over
+# a multi-year range × ~8 fuels clears that (e.g. 2 years ≈ 5900 rows). Our datasets are
+# all small and bounded (one BA × date range), so lift the guard rather than sample.
+alt.data_transformers.disable_max_rows()
+
 
 def _setting(name: str) -> str | None:
     """Config value from an env var (local dev) or st.secrets (Community Cloud).
@@ -156,6 +161,26 @@ PRICE_SERIES = [
 
 MIN_R = 0.3  # below this, a straight-line weather baseline explains too little to be useful
 
+# Generation-mix buckets: the 16 EIA-930 fuel codes grouped into recognizable sources,
+# in stack order bottom → top (fossil base, renewables, storage discharge, other on top).
+# The mart keeps every raw code (M-19); this grouping is presentation-only. Color is keyed
+# on the bucket, so switching BA never repaints one — color follows the entity, not its
+# rank. Hues CVD-checked (dataviz validator, worst adjacent ΔE 30) and reuse the app's
+# tones (#4c78a8 = the primary blue). Storage = battery + pumped-storage *discharge* only
+# (gross-positive, M-19) — a real feed to the grid. Any unlisted code folds into Other.
+FUEL_MIX = [
+    # (bucket label, hex, [member EIA-930 codes])
+    ("Coal",        "#5c5c5c", ["COL"]),
+    ("Nuclear",     "#7b6cd0", ["NUC"]),
+    ("Natural gas", "#f58518", ["NG"]),
+    ("Petroleum",   "#8c564b", ["OIL"]),
+    ("Hydro",       "#4c78a8", ["WAT"]),
+    ("Solar",       "#eeca3b", ["SUN", "SNB"]),            # SNB = solar + integrated battery
+    ("Wind",        "#72b7b2", ["WND", "WNB"]),            # WNB = wind + integrated battery
+    ("Storage",     "#e45756", ["BAT", "PS", "OES", "UES"]),  # discharge to grid
+    ("Other",       "#bab0ac", ["OTH", "GEO", "UNK"]),
+]
+
 
 def season_range(season_key: str, year: int) -> tuple[str, str]:
     """(start, end) ISO dates for a season in a given year. Winter spans Dec Y → Feb Y+1."""
@@ -279,6 +304,53 @@ with tab_gen:
         st.info(f"No generation for {ba} in {start} → {end}.")
     else:
         st.line_chart(gen[["renewable_share"]])
+
+    st.subheader("Generation mix by fuel — daily")
+    st.caption(
+        "Source: `REPORTING.VW_GENERATION_BY_FUEL_DAILY`. Daily gross generation (MWh) "
+        f"for {ba}, stacked by fuel source (M-19). Gross = production only (storage "
+        "charging clamped to 0), so the bands sum to the day's output — the fuel mix and "
+        "how it shifts across seasons and years. The renewable share above is the "
+        "solar + wind + hydro bands' share of this total."
+    )
+    mix = query(
+        f"select date, fuel_type, gross_mwh "
+        f"from reporting.vw_generation_by_fuel_daily where ba = '{ba}' "
+        f"and date between '{start}' and '{end}' order by date"
+    )
+    if mix.empty:
+        st.info(f"No generation-by-fuel for {ba} in {start} → {end}.")
+    else:
+        code_to_bucket = {code: label for label, _, codes in FUEL_MIX for code in codes}
+        bucket_order = {label: i for i, (label, _, _) in enumerate(FUEL_MIX)}
+        # Fold the 16 raw codes into display buckets, then sum so there's one row per
+        # (date, bucket) — Solar = SUN + SNB, Storage = BAT + PS + …; unlisted → Other.
+        mix["fuel"] = mix["fuel_type"].map(code_to_bucket).fillna("Other")
+        agg = mix.groupby(["date", "fuel"], as_index=False)["gross_mwh"].sum()
+        agg["fuel_order"] = agg["fuel"].map(bucket_order)
+        agg["date"] = pd.to_datetime(agg["date"])
+        domain = [label for label, _, _ in FUEL_MIX]
+        rng = [color for _, color, _ in FUEL_MIX]
+        mix_chart = (
+            alt.Chart(agg)
+            # white top-stroke on each band = a thin surface gap between stacked fuels
+            .mark_area(line={"color": "white", "strokeWidth": 0.5})
+            .encode(
+                x=alt.X("date:T", title="date"),
+                y=alt.Y("gross_mwh:Q", stack=True,
+                        title="daily gross generation (MWh)"),
+                color=alt.Color("fuel:N", title="fuel",
+                                scale=alt.Scale(domain=domain, range=rng), sort=domain),
+                order=alt.Order("fuel_order:Q"),  # deterministic stack order
+                tooltip=[
+                    alt.Tooltip("date:T", title="date"),
+                    alt.Tooltip("fuel:N", title="fuel"),
+                    alt.Tooltip("gross_mwh:Q", title="gross MWh", format=",.0f"),
+                ],
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(mix_chart, use_container_width=True)
 
     st.subheader("Intraday profile — the duck curve")
     st.caption(

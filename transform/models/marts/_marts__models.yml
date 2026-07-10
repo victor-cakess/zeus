@@ -45,6 +45,42 @@ models:
           arguments:
             combination_of_columns: [ba, period]
 
+  - name: fct_generation_by_fuel_daily
+    description: >
+      Daily generation-by-fuel fact — int_eia__generation_by_fuel_daily
+      materialized as a plain table (M-5), the consumption surface behind the
+      dashboard's generation-mix stacked area. Grain: one row per
+      (ba, date, fuel_type) — LONG, so a new EIA-930 fuel code appears as rows,
+      never a schema change (same shape as fct_demand_accuracy, M-15). gross_mwh
+      only (M-19); single-source (EIA), no cross-source join. Rebuilt each run.
+    config:
+      materialized: table
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+        data_tests: [not_null]
+      - name: date
+        description: UTC calendar day of the generation periods (M-7).
+        data_tests: [not_null]
+      - name: fuel_type
+        description: EIA-930 fuel code (COL, NG, NUC, OIL, WAT, SUN, WND, OTH, ...).
+        data_tests: [not_null]
+      - name: fuel_type_name
+        description: Human-readable fuel name (e.g. "Solar") for chart legends.
+      - name: gross_mwh
+        description: >
+          Daily gross generation from this fuel (MWh) — hourly values clamped at 0
+          before summing (M-19). >= 0 by construction (tested).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, date, fuel_type]
+
   - name: fct_demand_hourly
     description: >
       Hourly demand fact — the marts-layer materialization of

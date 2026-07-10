@@ -59,6 +59,7 @@ dashboard identity above, so nothing else is required. See RUNBOOK.md → dashbo
 
 **Generation tab**
 - **Renewable share** — `vw_energy_daily`, daily share of gross generation from solar + wind + hydro (ratio of sums, M-6): the decarbonization trend and seasonal rhythm.
+- **Generation mix by fuel** — `vw_generation_by_fuel_daily`, daily gross MWh stacked by fuel source (M-19), one color per source. The 16 raw EIA-930 codes are grouped into ~9 recognizable buckets for display (Solar = SUN + SNB, Storage = battery + pumped-storage discharge, …); colors are pinned to the bucket so switching BA never repaints a band, and the bands sum to the day's total gross output (the renewable-share numerator sits inside it).
 - **Intraday profile — the duck curve** — `vw_generation_hourly`, average generation by hour of day (UTC): the midday renewable hump and evening net-load ramp.
 
 **Weather tab** (own season + year picker)

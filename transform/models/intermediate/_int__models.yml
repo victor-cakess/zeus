@@ -38,6 +38,40 @@ models:
           arguments:
             combination_of_columns: [ba, period]
 
+  - name: int_eia__generation_by_fuel_daily
+    description: >
+      EIA generation by fuel type rolled up to the day — gross MWh per
+      (ba, date, fuel_type). Recovers the fuel detail stg_eia__generation carries
+      that int_eia__generation_hourly sums away (M-19). Gross only: each fuel
+      clamped at 0 before summing (M-1/M-2), so the daily mix stacks. date = UTC
+      calendar day of period (M-7). All EIA-930 fuel codes, no grouping; rows exist
+      only for the (ba, fuel) combos EIA reports (natural sparsity, no zero-fill).
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+        data_tests: [not_null]
+      - name: date
+        description: UTC calendar day of the generation periods (M-7).
+        data_tests: [not_null]
+      - name: fuel_type
+        description: EIA-930 fuel code (COL, NG, NUC, OIL, WAT, SUN, WND, OTH, ...).
+        data_tests: [not_null]
+      - name: fuel_type_name
+        description: Human-readable fuel name (e.g. "Solar") for chart legends.
+      - name: gross_mwh
+        description: >
+          Daily gross generation from this fuel (MWh) — hourly values clamped at 0
+          before summing (M-19). >= 0 by construction (tested).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, date, fuel_type]
+
   - name: int_eia_region__demand_hourly
     description: >
       EIA region data pivoted from (ba, period, metric) narrow to one row per
