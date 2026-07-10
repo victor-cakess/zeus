@@ -650,3 +650,51 @@ known baseline; material drift from it, or a new BA appearing, is the signal.
 - A perpetual ~9.9k-row warn: consumers must read the count against the
   recorded baseline rather than expecting zero. Revisit if it proves noisy —
   e.g. split into a tight anomaly test (error) + a monitored view (finding).
+
+---
+
+## M-19. Generation-by-fuel: a daily gross-MWh mart, long by fuel type
+
+**Chosen:** a dedicated daily path — `int_eia__generation_by_fuel_daily` →
+`fct_generation_by_fuel_daily` → `vw_generation_by_fuel_daily` — at grain
+`(ba, date, fuel_type)`, carrying **gross MWh** per fuel (each fuel clamped at 0
+before summing, M-1/M-2). Long, not wide: one row per fuel, so a new EIA-930 code
+appears as rows, never a schema change. Feeds the dashboard's daily generation-mix
+stacked area (Generation tab).
+
+**Alternatives considered:**
+- **Widen `fct_energy_daily` with fuel columns** — a `coal_mwh, gas_mwh, …` block
+  bolted onto the cross-source mart. Freezes the fuel list into the schema (a new
+  code = a migration), bloats a mart whose grain is `(ba, date)` with source-specific
+  detail, and mixes a single-source breakdown into the weather/demand join.
+- **Read fuel detail straight from staging in the dashboard** — impossible by design:
+  the dashboard role holds SELECT on `REPORTING.*` only (the governance boundary). The
+  data must reach a reporting view or the app physically cannot see it.
+- **Net MWh** — lets storage-charging / station-service hours go negative, which a
+  stacked mix can't represent. Gross = production *from that source* is the honest
+  per-fuel quantity, consistent with `renewable_gross_mwh` (M-1).
+- **Hourly grain** — a fuel-resolved duck curve. Deferred: the dashboard's default
+  range is up to ~2 years, where daily is the readable grain; the hourly shape stays
+  recoverable from staging if a later product needs it (M-0 aggregate-late spirit).
+
+**Why:**
+- The fuel mix is a first-class question ("what runs this grid, and how is that
+  changing"), so it earns its own model rather than riding on the cross-source mart.
+- Long-by-fuel mirrors `fct_demand_accuracy` (long by forecaster, M-15): new
+  categories are data, not DDL.
+- Gross + daily reuse conventions already set on the generation path (M-1/M-2, M-0),
+  so nothing new to reason about downstream.
+
+**Trade-offs:**
+- A second pass over `stg_eia__generation`: the incremental `fct_generation_hourly`
+  exists to avoid re-scanning landing, and this daily mart re-scans it once per build.
+  Accepted — the output is small (~71 BA × ~8 fuels × days) and the XS warehouse
+  absorbs one more staging scan. Escalation if build time bites: make the mart
+  incremental on a trailing window, like `fct_generation_hourly`.
+- Gross-only means this mart can't answer net-load / storage questions; those stay on
+  `fct_energy_daily.total_net_mwh`.
+- The mart keeps all 16 raw EIA-930 codes (COL/NG/NUC/OIL/WAT/SUN/WND/OTH plus storage
+  variants BAT/PS/SNB/WNB/OES/UES, GEO, UNK). Collapsing them into ~9 recognizable
+  buckets (Solar = SUN + SNB, Storage = battery + pumped-storage discharge, …) is a
+  **presentation** choice that lives in the dashboard, not the mart — the taxonomy can
+  change without a data migration, and the granular truth stays queryable.

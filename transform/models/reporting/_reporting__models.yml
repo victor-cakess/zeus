@@ -116,6 +116,25 @@ models:
       - name: renewable_share
         description: renewable_gross_mwh / total_gross_mwh, in [0, 1] (M-1); null when no gross.
 
+  - name: vw_generation_by_fuel_daily
+    description: >
+      Public-serving view over fct_generation_by_fuel_daily (the dashboard
+      generation-mix stacked area). 1:1 pass-through; one row per
+      (ba, date, fuel_type), gross MWh (M-19). Long by fuel, so a new EIA-930 code
+      appears as rows with no view change. Authorized by the dashboard role's
+      SELECT-on-future-REPORTING-views grant — no Terraform apply for a new vw_*.
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+      - name: date
+        description: UTC calendar day of the generation periods (M-7).
+      - name: fuel_type
+        description: EIA-930 fuel code (COL, NG, NUC, OIL, WAT, SUN, WND, OTH, ...).
+      - name: fuel_type_name
+        description: Human-readable fuel name (e.g. "Solar") for chart legends.
+      - name: gross_mwh
+        description: Daily gross generation from this fuel (MWh); >= 0 (M-19).
+
   - name: vw_fuel_prices_daily
     description: >
       Public-serving view over fct_fuel_prices_daily (the dashboard price charts).
