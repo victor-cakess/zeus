@@ -229,8 +229,8 @@ st.caption(
     "Detail in the **Data health** tab."
 )
 
-tab_gen, tab_wx, tab_px, tab_health = st.tabs(
-    ["Generation", "Weather", "Prices", "Data health"]
+tab_gen, tab_wx, tab_px, tab_ops, tab_health = st.tabs(
+    ["Generation", "Weather", "Prices", "Operators", "Data health"]
 )
 
 # --- Generation tab ----------------------------------------------------------
@@ -534,6 +534,158 @@ with tab_px:
             .properties(height=380),
             use_container_width=True,
         )
+
+# --- Operators tab -----------------------------------------------------------
+with tab_ops:
+    st.subheader("Forecast accuracy — scoring the operators")
+    st.caption(
+        "Source: `REPORTING.VW_DEMAND_ACCURACY` (the operators' own day-ahead demand "
+        "forecast `DF` scored against actual demand `D`, per BA-day; M-15). **WAPE** = "
+        "Σ|D−DF| / Σ|D| over the day's hours — lower is better. **Bias** is signed: "
+        "positive = the operator systematically over-forecasts. Partial days "
+        "(`hours_scored < 23`) are excluded, like everywhere else in this app."
+    )
+
+    range_days = (pd.Timestamp(end) - pd.Timestamp(start)).days or 1
+    min_days = max(7, min(30, range_days // 2))
+    league = query(
+        f"select ba, avg(wape) as mean_wape, avg(bias_pct) as mean_bias, "
+        f"       count(*) as days_scored "
+        f"from reporting.vw_demand_accuracy "
+        f"where forecaster = 'eia_df' and hours_scored >= 23 "
+        f"and date between '{start}' and '{end}' "
+        f"group by ba having count(*) >= {min_days} order by mean_wape"
+    )
+    if league.empty:
+        st.info(
+            f"No BA has at least {min_days} fully-scored days in {start} → {end}. "
+            "Widen the date range."
+        )
+    else:
+        st.subheader("League table — mean daily WAPE by BA")
+        st.caption(
+            f"{len(league)} demand-reporting BAs with ≥ {min_days} scored days in the "
+            "selected range, best first. Generation-only BAs publish no demand or "
+            "forecast, so they can't be scored."
+        )
+        league_chart = (
+            alt.Chart(league)
+            .mark_bar(color="#4c78a8", cornerRadiusEnd=4)
+            .encode(
+                x=alt.X("mean_wape:Q", title="mean daily WAPE",
+                        axis=alt.Axis(format=".0%")),
+                y=alt.Y("ba:N", title=None, sort="x"),
+                tooltip=[
+                    alt.Tooltip("ba:N", title="BA"),
+                    alt.Tooltip("mean_wape:Q", title="mean WAPE", format=".2%"),
+                    alt.Tooltip("mean_bias:Q", title="mean bias", format="+.2%"),
+                    alt.Tooltip("days_scored:Q", title="days scored"),
+                ],
+            )
+            .properties(height=max(240, 16 * len(league)))
+        )
+        st.altair_chart(league_chart, use_container_width=True)
+        with st.expander("Full table"):
+            st.dataframe(
+                pd.DataFrame({
+                    "BA": league["ba"],
+                    "mean WAPE": (league["mean_wape"] * 100).round(2),
+                    "mean bias %": (league["mean_bias"] * 100).round(2),
+                    "days scored": league["days_scored"],
+                }),
+                hide_index=True, use_container_width=True,
+            )
+
+        st.subheader(f"Forecast error over time — {ba}")
+        acc = query(
+            f"select date, wape, bias_pct from reporting.vw_demand_accuracy "
+            f"where ba = '{ba}' and forecaster = 'eia_df' and hours_scored >= 23 "
+            f"and date between '{start}' and '{end}' order by date"
+        )
+        if acc.empty:
+            st.info(
+                f"**{ba} publishes no demand forecast** — generation-only BAs report "
+                "NG/TI but no D/DF, so there is nothing to score. Pick a BA from the "
+                "league table above."
+            )
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Mean daily WAPE", f"{acc['wape'].mean():.2%}")
+            m2.metric("Mean bias", f"{acc['bias_pct'].mean():+.2%}",
+                      help="Positive = over-forecast, negative = under-forecast (M-15).")
+            m3.metric("Days scored", len(acc))
+
+            acc["date"] = pd.to_datetime(acc["date"])
+            acc_long = acc.melt(
+                id_vars="date", value_vars=["wape", "bias_pct"],
+                var_name="metric", value_name="value",
+            ).replace({"wape": "WAPE", "bias_pct": "bias"})
+            zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(
+                color="#9a9a9a", strokeDash=[4, 3]
+            ).encode(y="y:Q")
+            err_chart = (
+                alt.Chart(acc_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("date:T", title="date"),
+                    y=alt.Y("value:Q", title="fraction of daily demand",
+                            axis=alt.Axis(format="%")),
+                    color=alt.Color("metric:N", title=None,
+                                    scale=alt.Scale(domain=["WAPE", "bias"],
+                                                    range=["#4c78a8", "#e45756"])),
+                    tooltip=[
+                        alt.Tooltip("date:T", title="date"),
+                        alt.Tooltip("metric:N", title="metric"),
+                        alt.Tooltip("value:Q", title="value", format="+.2%"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(zero_rule + err_chart, use_container_width=True)
+            st.caption(
+                "WAPE (blue) is always ≥ 0; bias (red) crossing the dashed zero line "
+                "flips between over- and under-forecasting."
+            )
+
+            st.subheader(f"Does temperature break the forecast? — {ba}")
+            st.caption(
+                "Daily WAPE vs average temperature (`REPORTING.VW_ENERGY_DAILY`, M-3 "
+                "tavg). Extreme heat and cold are the hard days — expect a U-shape, "
+                "not a line, so no fit is drawn."
+            )
+            err_wx = query(
+                f"select a.date, a.wape, e.tavg "
+                f"from reporting.vw_demand_accuracy a "
+                f"join reporting.vw_energy_daily e on e.ba = a.ba and e.date = a.date "
+                f"where a.ba = '{ba}' and a.forecaster = 'eia_df' "
+                f"and a.hours_scored >= 23 and e.tavg is not null "
+                f"and a.date between '{start}' and '{end}'"
+            )
+            if err_wx.empty:
+                st.info(
+                    f"**{ba} has no NOAA weather coverage**, so the error↔temperature "
+                    "view isn't available for it. The league table and error trend "
+                    "above don't need weather."
+                )
+            else:
+                err_wx["date"] = pd.to_datetime(err_wx["date"])
+                wx_scatter = (
+                    alt.Chart(err_wx)
+                    .mark_circle(size=60, opacity=0.45, color="#4c78a8")
+                    .encode(
+                        x=alt.X("tavg:Q", title="daily average temperature (°C)",
+                                scale=alt.Scale(zero=False)),
+                        y=alt.Y("wape:Q", title="daily WAPE",
+                                axis=alt.Axis(format="%")),
+                        tooltip=[
+                            alt.Tooltip("date:T", title="date"),
+                            alt.Tooltip("tavg:Q", title="tavg (°C)", format=".1f"),
+                            alt.Tooltip("wape:Q", title="WAPE", format=".2%"),
+                        ],
+                    )
+                    .properties(height=340)
+                )
+                st.altair_chart(wx_scatter, use_container_width=True)
 
 # --- Data health tab ---------------------------------------------------------
 with tab_health:

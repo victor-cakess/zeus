@@ -686,7 +686,7 @@ Pulls 15 national energy price series from the St. Louis Fed's FRED API (`fred/s
 
 ## dbt pipeline
 
-Runs `dbt build` (staging + intermediate + marts models and their tests — 16 models, 74 tests) over `transform/` against `ZEUS_DEV`, daily, as the `Dbt` step of the state machine (decision 14) — between the ingest Parallel and the digest.
+Runs `dbt build` (staging + intermediate + marts models and their tests — 18 models, 74 tests) over `transform/` against `ZEUS_DEV`, daily, as the `Dbt` step of the state machine (decision 14) — between the ingest Parallel and the digest.
 
 ### DBT-1. Runner: a container-image Lambda
 
@@ -698,7 +698,7 @@ Runs `dbt build` (staging + intermediate + marts models and their tests — 16 m
 - **dbt Cloud** — managed scheduler/runner; a paid service and a second orchestrator when the state machine already owns the DAG.
 
 **Why:**
-- The whole daily build is well under a minute (16 models, 74 tests — duration detail in RUNBOOK) — squarely a Lambda-sized job; the 300 s timeout and 2048 MB leave generous headroom (memory detail in RUNBOOK).
+- The whole daily build is well under a minute (18 models, 74 tests — duration detail in RUNBOOK) — squarely a Lambda-sized job; the 300 s timeout and 2048 MB leave generous headroom (memory detail in RUNBOOK).
 - The state machine needs one more `lambda:invoke` step — dbt gets the exact same retry/catch/alert semantics as the ingests.
 - Image cold-start (a few seconds) is irrelevant for a daily batch.
 
@@ -708,7 +708,7 @@ Runs `dbt build` (staging + intermediate + marts models and their tests — 16 m
 
 ### DBT-2. Report-before-raise: the dbt run report feeds the digest
 
-**Chosen:** The handler summarizes the `dbtRunner` result (models built, tests passed/failed, failed-test **names**) and writes `reports/dbt/.../run_report.json` — same reports-layer layout as the ingests, with `source = dbt` — **before** raising on failure. The digest reads it alongside the source reports and renders dbt as its own section (subject chip `dbt 16 models / 74 tests` or `dbt FAILED 2 tests`; body lists the failed tests). dbt is **not** added to `SOURCES` (`eia,noaa,fred`) — it has no fan-out units, so it renders as a standalone section, not a per-source one.
+**Chosen:** The handler summarizes the `dbtRunner` result (models built, tests passed/failed, failed-test **names**) and writes `reports/dbt/.../run_report.json` — same reports-layer layout as the ingests, with `source = dbt` — **before** raising on failure. The digest reads it alongside the source reports and renders dbt as its own section (subject chip `dbt 18 models / 74 tests` or `dbt FAILED 2 tests`; body lists the failed tests). dbt is **not** added to `SOURCES` (`eia,noaa,fred`) — it has no fan-out units, so it renders as a standalone section, not a per-source one.
 
 **Why:**
 - A failing dbt test day produces a digest email that says **which** tests failed, plus the execution-level SNS alert (decision 8). Writing the report before raising is what guarantees the digest has the detail even on failure days; "dbt: no report" then only means dbt crashed before finishing.

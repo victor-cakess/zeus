@@ -2,14 +2,14 @@
 
 Demo consumption layer over the Zeus dbt models — a single Streamlit app that reads
 the **`REPORTING.VW_*` views only** (never the marts or the landing schemas) and
-renders charts across four tabs. Read-only; it writes nothing.
+renders charts across five tabs. Read-only; it writes nothing.
 
 Like `docs/architecture.py`, this is **not** a project dependency: it's pulled in
 on demand via `uv run --with`, so it never ships in any Lambda.
 
 A **sidebar** holds the global controls — balancing authority + date range — that
-drive the Generation and Prices tabs; the Weather tab keeps its own season + year
-picker. A **data-health banner** at the top shows per-source freshness and coverage.
+drive the Generation, Prices, and Operators tabs; the Weather tab keeps its own
+season + year picker. A **data-health banner** at the top shows per-source freshness and coverage.
 
 ## Governance — views-only, least privilege
 
@@ -68,6 +68,11 @@ dashboard identity above, so nothing else is required. See RUNBOOK.md → dashbo
 **Prices tab**
 - **National fuel & energy prices** — `vw_fuel_prices_daily`, pick any FRED series.
 - **Price ↔ demand** — FRED price (national, `vw_fuel_prices_daily`) ⨝ EIA demand (per-BA net MWh, `vw_energy_daily`) on `date`, dual-axis: does demand track the price or move independently?
+
+**Operators tab** (forecast accuracy — Phase 3a's marts)
+- **League table** — `vw_demand_accuracy`, mean daily WAPE of each operator's own day-ahead demand forecast over the selected range, best first (sorted bar + full table). Only demand-reporting BAs appear (generation-only BAs publish no D/DF); partial days (`hours_scored < 23`) excluded.
+- **Forecast error over time** — the selected BA's daily WAPE (blue, always ≥ 0) and signed bias (red; positive = over-forecast, M-15) on one axis, with a zero rule.
+- **Does temperature break the forecast?** — daily WAPE vs `tavg` (`vw_energy_daily`); extreme temperatures are the hard days, so a U-shape is expected and no fit line is drawn.
 
 **Data health tab** — per-source freshness, BA coverage on the latest day, the last fully-complete day, and the exclusions the weather charts apply (partial days + ~3-day weather lag).
 
