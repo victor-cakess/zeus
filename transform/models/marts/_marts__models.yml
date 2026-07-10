@@ -226,6 +226,10 @@ models:
         description: BA-mean sea-level pressure (hPa); null where unreported (M-3/M-4).
       - name: adpt
         description: BA-mean dew point (°C); null where unreported (M-3/M-4).
+      - name: hdd
+        description: Heating degree days (°F-days, base 65°F — M-17); nullable (M-4).
+      - name: cdd
+        description: Cooling degree days (°F-days, base 65°F — M-17); nullable (M-4).
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:

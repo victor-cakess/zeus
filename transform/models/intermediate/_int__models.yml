@@ -113,6 +113,26 @@ models:
         description: Mean across stations of average sea-level pressure (hPa).
       - name: adpt
         description: Mean across stations of average dew point (°C).
+      - name: hdd
+        description: >
+          Heating degree days (°F-days), base 65°F over the derived tavg —
+          degree days of the BA-mean temperature, not the mean of per-station
+          degree days (M-17). >= 0 by construction (tested); null when tavg is
+          null.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: cdd
+        description: >
+          Cooling degree days (°F-days), base 65°F over the derived tavg
+          (M-17). >= 0 by construction (tested); null when tavg is null.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:

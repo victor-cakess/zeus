@@ -572,3 +572,39 @@ fact; the intermediate pivot stays a view. Also recording the standing rejection
   (same as M-5).
 - If the eia_region lookback ever diverges from EIA's 7 days, the 10-day window
   here must be revisited independently.
+
+---
+
+## M-17. Degree days: base 65°F, °F-days, computed over the BA-mean tavg
+
+**Chosen:** `hdd` / `cdd` in `int_noaa__weather_daily` (passed through to
+`fct_energy_daily`, nullable per M-4): `hdd = max(65 − tavg°F, 0)`,
+`cdd = max(tavg°F − 65, 0)`, in **°F-days** with the **65°F base** — the US
+industry/EIA/NOAA convention — converting our °C `tavg` inline. Computed over
+the **derived BA-mean tavg** (M-3's `(tmax+tmin)/2`), which is exactly the
+daily-mean definition NOAA's official degree days use. Degree days **of the
+mean**, not the mean of per-station degree days.
+
+**Alternatives considered:**
+- **Base 18°C / °C-days** (the European convention) — the demand data is US
+  BAs; every published US benchmark (EIA, NOAA CPC) is 65°F-based, so °F-days
+  keep our numbers directly comparable.
+- **Mean of per-station degree days** — by Jensen's inequality DD(mean) ≤
+  mean(DD) when stations straddle the base, so per-station-then-average is
+  arguably more physical; but it breaks consistency with every other weather
+  column (all BA-means, M-3) and with how consumers will sanity-check against
+  published BA-level figures.
+- **Hourly degree hours from EIA-region temps** — no hourly temperature source
+  ingested; NOAA daily summaries are the platform's weather truth.
+
+**Why:**
+- Comparable to published US degree-day data with zero adjustment.
+- One convention (M-3 BA-mean) carried through; the derivation lives in the
+  intermediate layer with every other weather judgment call.
+
+**Trade-offs:**
+- Slight understatement vs per-station degree days on days when a BA's
+  stations straddle 65°F (Jensen). Accepted for consistency; revisit only if
+  demand-response modeling (Phase 4) shows it matters.
+- °F-days beside °C temperature columns is a mixed-unit surface — documented
+  per column in the yml.
