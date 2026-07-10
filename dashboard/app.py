@@ -531,11 +531,35 @@ with tab_px:
         first_vals = prices.apply(
             lambda s: s.loc[s.first_valid_index()] if s.first_valid_index() else np.nan
         )
-        st.line_chart(prices / first_vals * 100)
+        indexed = (prices / first_vals * 100).reset_index()
+        indexed["date"] = pd.to_datetime(indexed["date"])
+        indexed_long = indexed.melt(
+            id_vars="date", var_name="series", value_name="idx"
+        ).dropna()
+        # log y: a Henry Hub 12x spike would otherwise stretch a linear axis so
+        # far that WTI doubling and elecprice's 11% drift both read as flat lines
+        px_chart = (
+            alt.Chart(indexed_long)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title="date"),
+                y=alt.Y("idx:Q", title="index (100 = range start, log scale)",
+                        scale=alt.Scale(type="log")),
+                color=alt.Color("series:N", title=None),
+                tooltip=[
+                    alt.Tooltip("date:T", title="date"),
+                    alt.Tooltip("series:N", title="series"),
+                    alt.Tooltip("idx:Q", title="index", format=".0f"),
+                ],
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(px_chart, use_container_width=True)
         st.caption(
-            "100 = the series' level at the range start; 200 = doubled since. "
-            "Spot prices (WTI, Henry Hub) swing hard; retail and PPI series are the "
-            "slow-moving passthrough."
+            "Log scale — equal vertical steps are equal *percentage* moves, so a "
+            "doubling looks the same anywhere on the axis. 100 = the series' level "
+            "at the range start. Spot prices (WTI, Henry Hub) swing hard; retail "
+            "and PPI series are the slow-moving passthrough."
         )
 
 # --- Operators tab -----------------------------------------------------------
