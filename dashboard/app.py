@@ -72,14 +72,43 @@ def _connection():
         warehouse=_setting("SNOWFLAKE_WAREHOUSE") or "ZEUS_DEV_DASHBOARD_WH",
         database=_setting("SNOWFLAKE_DATABASE") or "ZEUS_DEV",
         schema="REPORTING",
+        # heartbeat the session so it survives idle gaps while the process is
+        # awake; the expired-session retry in query() covers process suspension
+        client_session_keep_alive=True,
     )
+
+
+# Snowflake session errors that mean "the cached connection's tokens are dead —
+# reconnect": 390111 renewal failed, 390112 session expired, 390114 master
+# token expired. The Community Cloud process outlives the ~4 h master token
+# whenever the app sits idle, so the first visitor after a gap hits these.
+_SESSION_EXPIRED_ERRNOS = {390111, 390112, 390114}
+
+
+def _cursor():
+    conn = _connection()
+    if conn.is_closed():
+        _connection.clear()
+        conn = _connection()
+    return conn.cursor()
 
 
 @st.cache_data(ttl=600)
 def query(sql: str) -> pd.DataFrame:
-    """Run a read query, return a lowercase-columned DataFrame. Cached 10 min."""
-    cur = _connection().cursor()
-    cur.execute(sql)
+    """Run a read query, return a lowercase-columned DataFrame. Cached 10 min.
+
+    Retries once on an expired/closed cached session (see _SESSION_EXPIRED_ERRNOS):
+    drop the cached connection, reconnect, re-run. Any other error propagates.
+    """
+    try:
+        cur = _cursor()
+        cur.execute(sql)
+    except snowflake.connector.errors.Error as e:
+        if getattr(e, "errno", None) not in _SESSION_EXPIRED_ERRNOS:
+            raise
+        _connection.clear()
+        cur = _cursor()
+        cur.execute(sql)
     df = cur.fetch_pandas_all()
     df.columns = [c.lower() for c in df.columns]
     return df

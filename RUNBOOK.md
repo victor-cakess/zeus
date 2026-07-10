@@ -270,6 +270,8 @@ uv run --with streamlit --with snowflake-connector-python --with pandas \
     --with numpy --with altair --no-project streamlit run dashboard/app.py
 ```
 
+**Expired-session crash (`390114: Authentication token has expired`):** handled in `app.py` — the `@st.cache_resource` connection outlives Snowflake's ~4 h idle master token on Community Cloud, so `query()` catches session-expiry errnos (390111/390112/390114), drops the cached connection, reconnects, and retries once; the connection also sets `client_session_keep_alive`. If this traceback ever reappears, something bypassed `query()`.
+
 **Resource monitor (`ZEUS_DEV_DASHBOARD_MONITOR`):** 25 credits/month, notify at 75%, **suspend at 100%** (monthly reset). If the dashboard hits the cap it suspends until the next cycle — bump the quota in `snowflake_dashboard.tf` (`credit_quota`) and re-apply, or `alter resource monitor ZEUS_DEV_DASHBOARD_MONITOR set credit_quota = N`. Inspect: `show resource monitors;` / `show warehouses like 'ZEUS_DEV_DASHBOARD_WH';`.
 
 **Verify the least-privilege boundary** (as ACCOUNTADMIN):
