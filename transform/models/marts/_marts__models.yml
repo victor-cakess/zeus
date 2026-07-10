@@ -81,6 +81,13 @@ models:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns: [ba, period]
+      - energy_balance:
+          arguments:
+            demand_col: demand_mwh
+            net_generation_col: net_generation_mwh
+            total_interchange_col: total_interchange_mwh
+          config:
+            severity: warn
 
   - name: fct_demand_accuracy
     description: >

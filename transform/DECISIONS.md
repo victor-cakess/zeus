@@ -608,3 +608,45 @@ mean**, not the mean of per-station degree days.
   demand-response modeling (Phase 4) shows it matters.
 - °F-days beside °C temperature columns is a mixed-unit surface — documented
   per column in the yml.
+
+---
+
+## M-18. Energy-balance test: daily grain, dual tolerance, warn — a finding, not a filter
+
+**Chosen:** a custom generic test (`energy_balance`, on `fct_demand_hourly`)
+asserting the EIA-930 identity `D = NG − TI` (TI positive = net exports) at
+**(ba, day)** grain, breaching only when the daily residual clears **both**
+tolerances: **> 5% of the day's demand AND > 500 MWh**. Severity **warn** —
+M-8's surface-don't-clean policy extended cross-metric: a breach is a
+reporting-quality finding about the operator, never a row to fix or drop.
+
+Calibration (data look, 2026-07): the sign convention is confirmed by the data
+— 62% of 4.2M hourly rows satisfy `D = NG − TI` **exactly**. Hourly residuals
+carry metering-clock noise between the three independently reported series;
+daily sums absorb it (BA-day relative residual p90 ≈ 2.1%, under the 5% bar).
+The expected baseline at these tolerances is **~9.9k breaching BA-days across
+45 BAs (of 175k)**, dominated by BPAT and NW (~85% of their days — a chronic,
+structural mismatch in what Bonneville-area respondents report as demand, not
+an ingestion bug). The warn count is therefore a *characterization* with a
+known baseline; material drift from it, or a new BA appearing, is the signal.
+
+**Alternatives considered:**
+- **Hourly grain** — flags ~250k rows, most of it clock-boundary noise; the
+  physics claim is about energy over a period, not instantaneous alignment.
+- **Single tolerance** — relative-only flags trivial MWh on tiny BAs;
+  absolute-only flags proportionally meaningless gaps on PJM-sized BAs.
+- **Error severity / excluding chronic BAs** — turns a data-quality finding
+  into a build failure (or hides it); the landing layer is truth-as-received.
+- **Trailing-window test** (only recent days) — quieter, but silently forgets
+  the historical finding; the full-history warn keeps the platform honest.
+
+**Why:**
+- The test encodes the physics; the tolerances encode the measured noise floor;
+  the severity encodes the policy. Each is independently adjustable.
+- BPAT/NW chronic imbalance is exactly the kind of finding the analytics layer
+  exists to surface (and a candidate dashboard exhibit for 3d).
+
+**Trade-offs:**
+- A perpetual ~9.9k-row warn: consumers must read the count against the
+  recorded baseline rather than expecting zero. Revisit if it proves noisy —
+  e.g. split into a tight anomaly test (error) + a monitored view (finding).
