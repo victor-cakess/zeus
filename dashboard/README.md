@@ -66,7 +66,7 @@ dashboard identity above, so nothing else is required. See RUNBOOK.md → dashbo
 - **Expected vs. actual** — least-squares baseline from the prior-day relationship, plotted **by day of season** so each selected year is one continuous overlaid curve (solid = actual, dashed = expected), + a table of the days generation deviated most from what temperature predicted. A scenario baseline (explains the past), not a forecast.
 
 **Prices tab**
-- **National energy prices, indexed to 100** — `vw_fuel_prices_daily`, up to 6 FRED series indexed to 100 at the range start: units differ wildly ($/bbl vs $/MMBtu vs PPI points), so relative moves on one honest axis are the comparable signal. (Replaced a raw-units multiselect and a dual-axis price↔demand chart — dual axes mislead, and raw heterogeneous units flatten the small-unit series.)
+- **National energy prices, indexed to 100, log scale** — `vw_fuel_prices_daily`, up to 6 FRED series indexed to 100 at the range start: units differ wildly ($/bbl vs $/MMBtu vs PPI points), so relative moves on one honest axis are the comparable signal, and the log y keeps a 12× Henry Hub spike from flattening everything else (equal steps = equal % moves). (Replaced a raw-units multiselect and a dual-axis price↔demand chart — dual axes mislead; price↔demand correlation was measured at r≈0 in levels and stays out until Phase 5's locational prices.)
 
 **Operators tab** (forecast accuracy — Phase 3a's marts)
 - **League table** — `vw_demand_accuracy`, mean daily WAPE of each operator's own day-ahead demand forecast over the selected range, best first (sorted bar + full table). Only demand-reporting BAs appear (generation-only BAs publish no D/DF); partial days (`hours_scored < 23`) excluded.
