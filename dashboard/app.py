@@ -180,7 +180,7 @@ with st.sidebar:
     ba = st.selectbox(
         "Balancing authority", bas,
         index=bas.index("PJM") if "PJM" in bas else 0,
-        help="Drives Generation, Weather, and the price↔demand chart. "
+        help="Drives the Generation, Weather, and Operators tabs. "
              "Prices are national (no BA).",
     )
     # `ba` is interpolated into SQL below; constrain it to the DB-provided allow-list
@@ -194,8 +194,8 @@ with st.sidebar:
         value=((today - pd.Timedelta(days=730)).date(), today.date()),
         min_value=pd.Timestamp("2014-01-01").date(),
         max_value=today.date(),
-        help="Drives the Generation and Prices tabs. The Weather tab uses its own "
-             "season + year picker.",
+        help="Drives the Generation, Prices, and Operators tabs. The Weather tab "
+             "uses its own season + year picker.",
     )
     # st.date_input returns a single date mid-selection; wait for both ends.
     if not (isinstance(date_range, (tuple, list)) and len(date_range) == 2):
@@ -235,23 +235,21 @@ tab_gen, tab_wx, tab_px, tab_ops, tab_health = st.tabs(
 
 # --- Generation tab ----------------------------------------------------------
 with tab_gen:
-    st.subheader(f"Daily generation — {ba}")
-    st.caption("Source: `REPORTING.VW_ENERGY_DAILY` (EIA generation ⨝ NOAA weather).")
+    st.subheader(f"Renewable share — {ba}")
+    st.caption(
+        "Source: `REPORTING.VW_ENERGY_DAILY`. Share of gross generation from solar + "
+        "wind + hydro, daily (ratio of sums, M-6) — the decarbonization trend and the "
+        "seasonal rhythm of hydro, wind, and solar."
+    )
     gen = query(
-        f"select date, total_net_mwh, renewable_share "
+        f"select date, renewable_share "
         f"from reporting.vw_energy_daily where ba = '{ba}' "
         f"and date between '{start}' and '{end}' order by date"
     ).set_index("date")
     if gen.empty:
         st.info(f"No generation for {ba} in {start} → {end}.")
     else:
-        g1, g2 = st.columns(2)
-        with g1:
-            st.caption("Net generation (MWh)")
-            st.area_chart(gen[["total_net_mwh"]])
-        with g2:
-            st.caption("Renewable share")
-            st.line_chart(gen[["renewable_share"]])
+        st.line_chart(gen[["renewable_share"]])
 
     st.subheader("Intraday profile — the duck curve")
     st.caption(
@@ -481,58 +479,34 @@ with tab_wx:
 
 # --- Prices tab --------------------------------------------------------------
 with tab_px:
-    st.subheader("National fuel & energy prices")
-    st.caption("Source: `REPORTING.VW_FUEL_PRICES_DAILY` (FRED, national, by date).")
-    chosen = st.multiselect(
-        "Series", PRICE_SERIES, default=["wti", "brent", "henryhub"]
+    st.subheader("National energy prices — indexed to 100")
+    st.caption(
+        "Source: `REPORTING.VW_FUEL_PRICES_DAILY` (FRED, national). The raw series "
+        "live in incompatible units ($/bbl, $/MMBtu, PPI index points), so each is "
+        "**indexed to 100 at the start of the selected range** — one honest axis, and "
+        "the interesting question becomes visible: *which* energy price actually "
+        "moved, and by how much relative to the others?"
     )
-    if chosen:
+    chosen = st.multiselect(
+        "Series (up to 6)", PRICE_SERIES, default=["wti", "henryhub", "elecprice"],
+        max_selections=6,
+    )
+    if not chosen:
+        st.info("Pick at least one series.")
+    else:
         cols = ", ".join(chosen)
         prices = query(
             f"select date, {cols} from reporting.vw_fuel_prices_daily "
             f"where date between '{start}' and '{end}' order by date"
         ).set_index("date")
-        st.line_chart(prices)
-    else:
-        st.info("Pick at least one series.")
-
-    st.subheader("Price ↔ demand (cross-source)")
-    st.caption(
-        "Join FRED prices to EIA demand on `date` (M-12: consumers join the marts "
-        f"themselves). Does {ba} demand track the price, or move independently? Prices "
-        "are **national**; demand is per-BA (net MWh, the M-2 demand proxy)."
-    )
-    pseries = st.selectbox(
-        "Price series", PRICE_SERIES, index=PRICE_SERIES.index("henryhub")
-    )
-    dp = query(
-        f"select g.date, g.total_net_mwh, f.{pseries} as price "
-        f"from reporting.vw_energy_daily g "
-        f"join reporting.vw_fuel_prices_daily f on f.date = g.date "
-        f"where g.ba = '{ba}' and g.hours_reported >= 23 "
-        f"and g.date between '{start}' and '{end}' order by g.date"
-    )
-    if dp.empty:
-        st.info(f"No overlapping price + demand days for {ba} in {start} → {end}.")
-    else:
-        dp["date"] = pd.to_datetime(dp["date"])
-        base = alt.Chart(dp).encode(x=alt.X("date:T", title="date"))
-        demand_line = base.mark_line(color="#4c78a8").encode(
-            y=alt.Y("total_net_mwh:Q", title="demand — net MWh",
-                    scale=alt.Scale(zero=False), axis=alt.Axis(titleColor="#4c78a8")),
-            tooltip=[alt.Tooltip("date:T", title="date"),
-                     alt.Tooltip("total_net_mwh:Q", title="net MWh", format=",.0f")],
+        first_vals = prices.apply(
+            lambda s: s.loc[s.first_valid_index()] if s.first_valid_index() else np.nan
         )
-        price_line = base.mark_line(color="#e45756").encode(
-            y=alt.Y("price:Q", title=f"{pseries} (price)",
-                    scale=alt.Scale(zero=False), axis=alt.Axis(titleColor="#e45756")),
-            tooltip=[alt.Tooltip("date:T", title="date"),
-                     alt.Tooltip("price:Q", title=pseries, format=".2f")],
-        )
-        st.altair_chart(
-            alt.layer(demand_line, price_line).resolve_scale(y="independent")
-            .properties(height=380),
-            use_container_width=True,
+        st.line_chart(prices / first_vals * 100)
+        st.caption(
+            "100 = the series' level at the range start; 200 = doubled since. "
+            "Spot prices (WTI, Henry Hub) swing hard; retail and PPI series are the "
+            "slow-moving passthrough."
         )
 
 # --- Operators tab -----------------------------------------------------------
