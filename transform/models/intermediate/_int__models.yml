@@ -21,6 +21,15 @@ models:
         description: >
           Gross production for the hour (MWh) — each fuel value clamped at 0 before
           summing. The renewable_share denominator (M-1).
+        # Sentinel guard (M-20): after the per-fuel QC bound, the all-fuel hourly gross
+        # can't reach the old 2^31 / multi-million garbage; US48 (national aggregate) tops
+        # out well under 2M MWh/hr, so a survivor fails here.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 2000000
+                inclusive: true
       - name: renewable_gross_mwh
         description: Solar + wind + hydro gross production for the hour (MWh), clamped at 0.
       - name: renewable_share
@@ -86,20 +95,47 @@ models:
       - name: period
         description: Hour, UTC (timestamp_ntz).
         data_tests: [not_null]
+      # Enforce (error) that the M-20 QC bound worked: these are single per-(ba,period)
+      # values, so the bound holds directly. Upper 1M clears US48 (national ~776k);
+      # D/DF are non-negative, NG/TI are signed.
       - name: demand_mwh
         description: >
           Demand for the hour (MWh, metric D); null for generation-only BAs
           (expected data shape, not an error).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1000000
+                inclusive: true
       - name: demand_forecast_mwh
         description: >
           The grid operator's day-ahead demand forecast for the hour (MWh,
           metric DF); null for generation-only BAs.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1000000
+                inclusive: true
       - name: net_generation_mwh
         description: Net generation for the hour (MWh, metric NG).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -1000000
+                max_value: 1000000
+                inclusive: true
       - name: total_interchange_mwh
         description: >
           Total interchange for the hour (MWh, metric TI) — EIA sign convention:
           positive = net exports to neighboring BAs.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -1000000
+                max_value: 1000000
+                inclusive: true
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:
@@ -121,32 +157,71 @@ models:
         data_tests: [not_null]
       - name: station_count
         description: Number of stations averaged into this BA-day (data-quality signal).
+      # Enforce (error) that the M-20 QC bound worked: the areal mean of bounded
+      # readings stays within the same physical range the staging schema.yml surfaces
+      # as warn (M-8). These pass because the out-of-range readings were nulled upstream.
       - name: tmax
         description: Mean across stations of daily max temperature (°C).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: -60, max_value: 60, inclusive: true }
       - name: tmin
         description: Mean across stations of daily min temperature (°C).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: -60, max_value: 60, inclusive: true }
       - name: tavg
         description: >
           Derived daily average temperature (°C) — (tmax + tmin) / 2 over the BA-level
           means, NOT the raw TAVG datatype (99.9% null in our station set; M-3).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: -60, max_value: 60, inclusive: true }
       - name: prcp
         description: Mean across stations of precipitation (mm).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 0, max_value: 1000, inclusive: true }
       - name: snow
         description: Mean across stations of snowfall (mm).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 0, max_value: 2500, inclusive: true }
       - name: snwd
         description: Mean across stations of snow depth (mm).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 0, max_value: 12000, inclusive: true }
       - name: awnd
         description: Mean across stations of average daily wind speed (m/s).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 0, max_value: 50, inclusive: true }
       - name: wsf2
         description: Mean across stations of fastest 2-minute wind speed (m/s).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 0, max_value: 100, inclusive: true }
       - name: wsf5
         description: Mean across stations of fastest 5-second wind speed (m/s).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 0, max_value: 120, inclusive: true }
       - name: rhav
         description: Mean across stations of average relative humidity (%).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 0, max_value: 100, inclusive: true }
       - name: aslp
         description: Mean across stations of average sea-level pressure (hPa).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: 870, max_value: 1090, inclusive: true }
       - name: adpt
         description: Mean across stations of average dew point (°C).
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments: { min_value: -60, max_value: 40, inclusive: true }
       - name: hdd
         description: >
           Heating degree days (°F-days), base 65°F over the derived tavg —
