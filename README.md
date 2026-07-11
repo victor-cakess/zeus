@@ -2,6 +2,8 @@
 
 A serverless **energy-data platform** on AWS + Snowflake. One Step Functions state machine runs the whole daily flow: four ingestion pipelines — **EIA** (hourly fuel-type generation), **EIA region** (hourly demand, day-ahead demand forecast, net generation, and interchange per balancing authority), **NOAA** (daily weather summaries), and **FRED** (national energy prices) — run in parallel, each landing raw JSON + a curated Parquet in S3 and `COPY`ing it into a Snowflake landing table; a **dbt** container-image Lambda then builds and tests the modeled layers (staging → intermediate → marts); finally a **digest** Lambda emails one combined run-report across all sources plus the dbt run. The digest always runs, even when an upstream step fails.
 
+**Live dashboard: [zeusapplication.streamlit.app](https://zeusapplication.streamlit.app)** — the platform's serving layer, read straight from the `REPORTING` views ([screenshots below](#dashboard)).
+
 EIA and NOAA are deliberately keyed on the same balancing-authority codes (`ba`) so weather joins to generation in the marts; FRED prices are national and land as a standalone mart (a consumer can join them on `date`).
 
 > **Where things live:** architecture decisions → [ADR.md](ADR.md) · modeling decisions → [transform/DECISIONS.md](transform/DECISIONS.md) · operational commands & per-pipeline detail → [RUNBOOK.md](RUNBOOK.md) · conventions for *changing* the platform → [CLAUDE.md](CLAUDE.md).
@@ -167,6 +169,22 @@ erDiagram
     INT_FRED__PRICES_DAILY ||--|| FCT_FUEL_PRICES_DAILY : "materialize as table (standalone, M-12)"
 ```
 
+## Dashboard
+
+The serving layer in action — **[zeusapplication.streamlit.app](https://zeusapplication.streamlit.app)**: a read-only Streamlit app ([`dashboard/`](dashboard/)) over the `REPORTING` views, connecting as a least-privilege role on a resource-monitor-capped warehouse ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)).
+
+![Generation mix by fuel — daily stacked area](docs/screenshots/generation_by_source.png)
+
+<sub>**Generation** — daily gross generation stacked by fuel source (M-19); the 16 raw EIA-930 fuel codes grouped into recognizable buckets, colors pinned per fuel.</sub>
+
+![Weather ⨝ generation — the D−1 lag](docs/screenshots/weatherxgeneration.png)
+
+<sub>**Weather ⨝ generation** — same-day vs. prior-day max temperature against gross generation, Pearson r on each join (M-7): the thermal-inertia lag, visible.</sub>
+
+![Forecast error over time — WAPE and bias](docs/screenshots/forecast.png)
+
+<sub>**Operators** — the operator's own day-ahead demand forecast scored against actual demand per BA-day: daily WAPE and signed bias (M-15).</sub>
+
 ## Tech stack
 
 | Concern | Choice |
@@ -187,7 +205,7 @@ erDiagram
 - **Modeling (live):** dbt — **21 models** (4 staging + 5 intermediate + 6 marts + 6 reporting views), **103 tests**. Includes the demand/forecast-accuracy layer over region-data (`fct_demand_hourly`, `fct_demand_accuracy` — WAPE/bias per BA-day) base-65°F degree days (`hdd`/`cdd`) on `fct_energy_daily`, and a warn-severity energy-balance test (`D = NG − TI` per BA-day — it surfaces real EIA-930 reporting gaps, see M-18); interchange analytics come next.
 - **Orchestration (live):** one Step Functions state machine on a 07:00 UTC daily cron; the digest always runs, any failure alerts via SNS and marks the execution Failed.
 - **CI/CD (live):** offline gates (gitleaks + `dbt parse` + an offline Lambda unit suite (`pytest`) + `terraform fmt/validate`), a zero-copy clone CI for dbt PRs, and a decoupled dbt-image CD via GitHub OIDC.
-- **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a Streamlit dashboard ([`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)). Five tabs, including the **Operators** forecast-accuracy league (WAPE/bias per BA).
+- **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a public Streamlit dashboard ([zeusapplication.streamlit.app](https://zeusapplication.streamlit.app), source in [`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)). Five tabs, including the **Operators** forecast-accuracy league (WAPE/bias per BA).
 - **History:** EIA 2017→, NOAA 2010→, FRED 2014→ backfilled; EIA region-data backfilled 2019→ (the API route's full availability — its `startPeriod` is 2019-01-01).
 
 ## Repository layout
