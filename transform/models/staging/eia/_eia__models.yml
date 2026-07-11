@@ -22,6 +22,19 @@ models:
         description: Human-readable fuel-type label.
       - name: generation_mwh
         description: Generation for the hour/fuel, in megawatthours.
+        # Surface (warn) raw out-of-range garbage; the QC-null lands in intermediate
+        # (M-8 → M-20). US48 (Lower-48 national aggregate) legitimately exceeds a per-BA
+        # ceiling, so scope to non-US48; magnitude bound (generation is signed).
+        data_tests:
+          - dbt_utils.accepted_range:
+              name: eia_generation_bounds_ba
+              arguments:
+                min_value: -300000
+                max_value: 300000
+                inclusive: true
+              config:
+                severity: warn
+                where: "ba <> 'US48'"
       - name: value_units
         description: Source units string (constant "megawatthours").
         # Units contract — if EIA ever changes the unit, every MWh column upstream

@@ -698,3 +698,65 @@ stacked area (Generation tab).
   buckets (Solar = SUN + SNB, Storage = battery + pumped-storage discharge, …) is a
   **presentation** choice that lives in the dashboard, not the mart — the taxonomy can
   change without a data migration, and the granular truth stays queryable.
+
+---
+
+## M-20. QC bounds land in intermediate: null out-of-range values, respondent-aware ceiling
+
+**Chosen:** the QC-null rule M-8 anticipated now lands in the **intermediate** layer for
+EIA (`int_eia__generation_hourly`, `int_eia__generation_by_fuel_daily`), EIA region
+(`int_eia_region__demand_hourly`), and NOAA (`int_noaa__weather_daily`). Physically-
+impossible values are set to **NULL** before any `SUM`/`AVG`/`MAX`; the row and its other
+columns survive. The ceiling is **respondent-aware**: `US48` (the EIA Lower-48 national
+aggregate, which runs ~10x a single BA) gets a 1,000,000 MWh/hour ceiling, every other
+respondent 300,000; demand and day-ahead forecast (D/DF) are additionally floored at 0
+(demand can't be negative), while generation and interchange stay signed (magnitude bound
+only). NOAA reuses the physical ranges the staging `schema.yml` already asserts (M-8).
+The bound **numbers** live in the model SQL + the yml tests (the contract); this entry
+records the policy. Enforcement is an `error`-level `accepted_range` on the **intermediate**
+output; the staging bounds tests stay `warn` (surfacing).
+
+**Alternatives considered:**
+- **Interpolate the gap (mean of neighbouring hours/days)** — fabricates a value that then
+  reads as a real observation on the dashboard, contradicting the honest-nulls principle
+  (M-3, M-11), and needs LAG/LEAD with edge cases (first/last row, consecutive bad values,
+  neighbour also out of range). Every downstream rollup ignores NULLs, so nulling costs a
+  daily mean at most one of ~24 hours — not worth the fabrication.
+- **Drop the whole row** — wrong grain for the wide NOAA model (one bad `tmax` would discard
+  the row's good `prcp`/wind) and the EIA-region pivot; also shrinks the grid instead of
+  marking the gap. Per-value nulling is the right granularity.
+- **A flat, respondent-blind ceiling** — rejected after empirical validation (2026-07-11):
+  `US48` demand legitimately reaches ~776k and net generation similar, and EIA-930 region
+  aggregates (MIDA ~224k, MIDW, TEX, …) sit well above a single BA. A flat 250–300k cap
+  would have nulled ~66k legitimate US48 rows. Every *non-US48* value over 300k, by contrast,
+  was garbage (2^31 sentinels, a 465-row BANC bad-data run at ~3.3M against a ~4k real scale,
+  FMPP rows ~90x its size), so one exemption cleanly separates garbage from truth.
+- **Clean in staging (the single chokepoint)** — forbidden by the layering rule: a bounds
+  threshold is a judgment call, and staging is zero-judgment (M-8). Cleaning belongs here.
+
+**Why:**
+- Impossible values (a single-BA hour of 3.3M MWh, −72.7 °C) blow out every mart's min/max
+  and any chart axis; nulling them at the first post-staging layer protects all consumers
+  while landing/staging keep the raw truth (append-only, M-8).
+- Respondent-aware with a single `US48` exemption is the simplest rule that never nulls a
+  legitimate value — the paramount constraint — while still catching the moderate garbage a
+  high flat cap would miss.
+- `error`-level `accepted_range` on the cleaned intermediate output turns "the filter worked"
+  into an enforced, self-checking contract; a future regression fails the build.
+
+**Trade-offs:**
+- **Borderline garbage below the ceiling survives**, by construction: a non-US48 value in
+  (its real scale, 300k] is not caught (e.g. a lone ~250k single-fuel BA hour). The staging
+  `warn` tests still surface these; tightening would risk nulling legitimate data, so the
+  line is deliberate. A per-respondent relative bound (e.g. > N× that respondent's median)
+  would catch them but adds window-function complexity and opacity — deferred.
+- **`US48`'s own ceiling is loose** (1M): a US48-scale sentinel between 776k and 1M would pass.
+  US48 has no garbage today; revisit if that changes.
+- **`station_count` in `int_noaa__weather_daily`** counts a station present in the row even
+  when a specific datatype was nulled, so it can slightly overstate the backing for that
+  datatype (noted in the model).
+- M-8's note said the staging `warn` tests would "upgrade to error" once a QC rule landed;
+  in practice staging stays raw (its own no-mutation rule), so the `error` assertion lives on
+  the cleaned **intermediate** output instead, and staging tests remain `warn` (surfacing).
+- The `US48`-exemption ceiling is duplicated across the three EIA models (one CASE each);
+  accepted over a shared macro/model per the project's inline-clamp idiom (M-1/M-2).

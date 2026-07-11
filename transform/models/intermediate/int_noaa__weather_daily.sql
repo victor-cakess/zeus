@@ -11,6 +11,31 @@ with weather as (
     select * from {{ ref('stg_noaa__weather') }}
 ),
 
+bounded as (
+    -- QC bounds (DECISIONS.md M-20): null out-of-range sensor readings (e.g. the known
+    -- -72.7 °C tmin, 152 m/s wind) before the areal mean, using the SAME physical ranges
+    -- the staging schema.yml asserts (M-8). tavg is derived from tmax/tmin below and wdf2
+    -- is dropped in aggregation, so neither needs bounding here. Caveat: station_count
+    -- still counts a station present in the row even when a given datatype was nulled,
+    -- so it can slightly overstate the backing for a specific datatype.
+    select
+        ba,
+        observation_date,
+        station,
+        case when tmax between -60 and 60   then tmax end as tmax,
+        case when tmin between -60 and 60   then tmin end as tmin,
+        case when prcp between 0 and 1000   then prcp end as prcp,
+        case when snow between 0 and 2500   then snow end as snow,
+        case when snwd between 0 and 12000  then snwd end as snwd,
+        case when awnd between 0 and 50     then awnd end as awnd,
+        case when wsf2 between 0 and 100    then wsf2 end as wsf2,
+        case when wsf5 between 0 and 120    then wsf5 end as wsf5,
+        case when rhav between 0 and 100    then rhav end as rhav,
+        case when aslp between 870 and 1090 then aslp end as aslp,
+        case when adpt between -60 and 40   then adpt end as adpt
+    from weather
+),
+
 aggregated as (
     select
         ba,
@@ -30,7 +55,7 @@ aggregated as (
         avg(rhav) as rhav,
         avg(aslp) as aslp,
         avg(adpt) as adpt
-    from weather
+    from bounded
     group by ba, observation_date
 )
 
