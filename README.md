@@ -177,7 +177,7 @@ The serving layer in action — **[zeusapplication.streamlit.app](https://zeusap
 
 <sub>**Generation** — daily gross generation stacked by fuel source (M-19); the 16 raw EIA-930 fuel codes grouped into recognizable buckets, colors pinned per fuel.</sub>
 
-![Weather ⨝ generation — the D−1 lag](docs/screenshots/waetherxgeneration.png)
+![Weather ⨝ generation — the D−1 lag](docs/screenshots/weatherxgeneration.png)
 
 <sub>**Weather ⨝ generation** — same-day vs. prior-day max temperature against gross generation, Pearson r on each join (M-7): the thermal-inertia lag, visible.</sub>
 
