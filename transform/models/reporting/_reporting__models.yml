@@ -98,6 +98,60 @@ models:
       - name: total_interchange_mwh
         description: Total interchange (MWh, metric TI) — positive = net exports.
 
+  - name: vw_interchange_hourly
+    description: >
+      Public-serving view over fct_interchange_hourly (the dashboard Flows tab's
+      arc map). 1:1 pass-through; one directed row per (period, fromba, toba) —
+      both directions of a physical pair are distinct rows, each BA's own report
+      (M-22). Authorized by the dashboard role's SELECT-on-future-REPORTING-views
+      grant — no Terraform apply for a new vw_*.
+    columns:
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+      - name: fromba
+        description: Reporting balancing-authority code.
+      - name: fromba_name
+        description: Human-readable reporting-BA name.
+      - name: toba
+        description: Neighboring BA code (incl. Canadian/Mexican counterparties).
+      - name: toba_name
+        description: Human-readable neighbor-BA name.
+      - name: flow_mwh
+        description: "Signed flow (MWh): positive = fromba exports to toba (M-22)."
+
+  - name: vw_net_position_hourly
+    description: >
+      Public-serving view over fct_net_position_hourly (the dashboard Flows tab's
+      diverging bar + hour-of-day heatmap). 1:1 pass-through; one row per
+      (ba, period); net_position_mwh positive = net exporter (M-22).
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+      - name: exports_mwh
+        description: Sum of the hour's positive flows (MWh).
+      - name: imports_mwh
+        description: Sum of the hour's negative flows, sign-flipped (MWh).
+      - name: net_position_mwh
+        description: exports − imports (MWh, signed); positive = net exporter (M-22).
+
+  - name: vw_ba_centroids
+    description: >
+      Public-serving view over the ba_centroids seed (the Flows tab's arc-map
+      anchor points, joined in pandas against both arc ends — M-23). 1:1
+      pass-through; one row per physical balancing authority; hand-curated
+      approximate coordinates, not survey data (M-23).
+    columns:
+      - name: ba
+        description: Balancing-authority code.
+      - name: ba_name
+        description: Human-readable balancing-authority name.
+      - name: latitude
+        description: Representative latitude (WGS84, decimal degrees).
+      - name: longitude
+        description: Representative longitude (WGS84, decimal degrees, negative = west).
+
   - name: vw_generation_hourly
     description: >
       Public-serving view over fct_generation_hourly (the dashboard duck-curve chart).

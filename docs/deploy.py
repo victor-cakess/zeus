@@ -54,7 +54,7 @@ with Diagram(
         ecr >> Edge(label="update-function-code") >> dbt_lambda
         dbt_lambda >> Edge(label="smoke-invoke\n(deploy gate:\nfails on bad test)", style="dashed") >> gha
 
-    # ---- Zip path: ingest (EIA/EIA_REGION/NOAA/FRED) + digest Lambdas ------
+    # ---- Zip path: ingest (EIA/EIA_REGION/EIA_INTERCHANGE/NOAA/FRED) + digest Lambdas
     with Cluster("Zip Lambdas — local build (Terraform apply)"):
         dev = User("developer\nuv pip install\n--target → zip")
         artifacts = S3("S3\nbuild artifacts\n(zip ~49 MiB)")

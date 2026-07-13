@@ -10,7 +10,7 @@ Run locally (from repo root) — key from a file:
     export SNOWFLAKE_ACCOUNT=<org>-<account>
     export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/sf_dashboard.p8"
     uv run --with streamlit --with snowflake-connector-python --with pandas \
-        --with numpy --with altair --no-project streamlit run dashboard/app.py
+        --with numpy --with altair --with pydeck --no-project streamlit run dashboard/app.py
 
 On Streamlit Community Cloud the account + PEM private key come from st.secrets
 (SNOWFLAKE_ACCOUNT, SNOWFLAKE_PRIVATE_KEY); user/role/warehouse default to the
@@ -22,6 +22,7 @@ import os
 import altair as alt
 import numpy as np
 import pandas as pd
+import pydeck as pdk
 import snowflake.connector
 import streamlit as st
 from cryptography.hazmat.primitives import serialization
@@ -248,8 +249,8 @@ with st.sidebar:
         value=((today - pd.Timedelta(days=730)).date(), today.date()),
         min_value=pd.Timestamp("2014-01-01").date(),
         max_value=today.date(),
-        help="Drives the Generation, Prices, and Operators tabs. The Weather tab "
-             "uses its own season + year picker.",
+        help="Drives the Generation, Prices, Operators, and Flows tabs. The Weather "
+             "tab uses its own season + year picker; the flow map has its own day.",
     )
     # st.date_input returns a single date mid-selection; wait for both ends.
     if not (isinstance(date_range, (tuple, list)) and len(date_range) == 2):
@@ -283,8 +284,8 @@ st.caption(
     "Detail in the **Data health** tab."
 )
 
-tab_gen, tab_wx, tab_px, tab_ops, tab_health = st.tabs(
-    ["Generation", "Weather", "Prices", "Operators", "Data health"]
+tab_gen, tab_wx, tab_px, tab_ops, tab_flows, tab_health = st.tabs(
+    ["Generation", "Weather", "Prices", "Operators", "Flows", "Data health"]
 )
 
 # --- Generation tab ----------------------------------------------------------
@@ -785,6 +786,239 @@ with tab_ops:
                     .properties(height=340)
                 )
                 st.altair_chart(wx_scatter, use_container_width=True)
+
+# --- Flows tab ----------------------------------------------------------------
+# Polarity encoding shared by all three visuals (diverging, gray midpoint):
+# blue = net exporter / exporting end, orange = net importer / importing end.
+EXPORT_BLUE = "#4c78a8"
+IMPORT_ORANGE = "#f58518"
+
+with tab_flows:
+    st.subheader("Interchange — who ships power to whom")
+    st.caption(
+        "Source: `REPORTING.VW_NET_POSITION_HOURLY` / `VW_INTERCHANGE_HOURLY` "
+        "(BA-to-BA flows, each BA's own reports; M-22). Sign convention everywhere: "
+        "**positive = net exporter, negative = net importer**. Neutral terms on "
+        "purpose — importing isn't freeloading, it's usually buying cheaper or "
+        "cleaner power than you can make."
+    )
+
+    st.subheader("Net importers vs net exporters")
+    st.caption(
+        f"Net interchange summed over {start} → {end}. Blue exports more than it "
+        "imports; orange the reverse. Physical BAs only — EIA regional aggregates "
+        "(US48, CAL, TEX, …) are excluded, they double-count their members (M-23)."
+    )
+    netpos = query(
+        f"select ba, sum(net_position_mwh) as net_mwh "
+        f"from reporting.vw_net_position_hourly "
+        f"where to_date(period) between '{start}' and '{end}' "
+        # the centroids seed doubles as the physical-BA registry (M-23)
+        f"and ba in (select ba from reporting.vw_ba_centroids) "
+        f"group by ba order by net_mwh desc"
+    )
+    if netpos.empty:
+        st.info(f"No interchange data in {start} → {end}.")
+    else:
+        zero_x = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(
+            color="#9a9a9a", strokeDash=[4, 3]
+        ).encode(x="x:Q")
+        net_bar = (
+            alt.Chart(netpos)
+            .mark_bar(cornerRadiusEnd=4)
+            .encode(
+                x=alt.X("net_mwh:Q", title="net interchange over range (MWh)"),
+                y=alt.Y("ba:N", title=None, sort="-x"),
+                color=alt.condition(
+                    alt.datum.net_mwh >= 0,
+                    alt.value(EXPORT_BLUE),
+                    alt.value(IMPORT_ORANGE),
+                ),
+                tooltip=[
+                    alt.Tooltip("ba:N", title="BA"),
+                    alt.Tooltip("net_mwh:Q", title="net MWh", format="+,.0f"),
+                ],
+            )
+            .properties(height=max(240, 14 * len(netpos)))
+        )
+        st.altair_chart(net_bar + zero_x, use_container_width=True)
+        with st.expander("Full table"):
+            st.dataframe(
+                pd.DataFrame({
+                    "BA": netpos["ba"],
+                    "net MWh": netpos["net_mwh"].round(0),
+                    "position": np.where(netpos["net_mwh"] >= 0,
+                                         "net exporter", "net importer"),
+                }),
+                hide_index=True, use_container_width=True,
+            )
+
+    st.subheader("The daily rhythm — net position by hour of day")
+    st.caption(
+        "Average net position per hour (UTC, M-7) over the selected range, each BA "
+        "**scaled to its own peak** so a small BA's rhythm isn't washed out by a "
+        "giant's magnitudes — color shows the *shape* (blue hours export, orange "
+        "hours import); the tooltip carries the real MWh. Solar BAs flip: midday "
+        "export hump, evening import ramp."
+    )
+    rhythm = query(
+        f"select ba, hour(period) as hour_utc, avg(net_position_mwh) as avg_net_mwh "
+        f"from reporting.vw_net_position_hourly "
+        f"where to_date(period) between '{start}' and '{end}' "
+        f"and ba in (select ba from reporting.vw_ba_centroids) "
+        f"group by ba, hour(period)"
+    )
+    if rhythm.empty:
+        st.info(f"No interchange data in {start} → {end}.")
+    else:
+        peak = rhythm.groupby("ba")["avg_net_mwh"].transform(
+            lambda s: s.abs().max()
+        )
+        rhythm["scaled"] = (rhythm["avg_net_mwh"] / peak.replace(0, np.nan)).fillna(0)
+        # Rows ordered by overall net position: exporters top, importers bottom.
+        ba_order = (
+            rhythm.groupby("ba")["avg_net_mwh"].mean()
+            .sort_values(ascending=False).index.tolist()
+        )
+        heat = (
+            alt.Chart(rhythm)
+            .mark_rect()
+            .encode(
+                x=alt.X("hour_utc:O", title="hour of day (UTC)"),
+                y=alt.Y("ba:N", title=None, sort=ba_order),
+                color=alt.Color(
+                    "scaled:Q",
+                    title="net position (share of own peak)",
+                    # blue = export, gray ≈ 0, orange = import — same polarity
+                    # pair as the bar above; reversed so positive lands on blue
+                    scale=alt.Scale(scheme="blueorange", domain=[-1, 1], reverse=True),
+                    legend=alt.Legend(format=".0%"),
+                ),
+                tooltip=[
+                    alt.Tooltip("ba:N", title="BA"),
+                    alt.Tooltip("hour_utc:O", title="hour (UTC)"),
+                    alt.Tooltip("avg_net_mwh:Q", title="avg net MWh", format="+,.0f"),
+                ],
+            )
+            .properties(height=max(300, 13 * rhythm["ba"].nunique()))
+        )
+        st.altair_chart(heat, use_container_width=True)
+
+    st.subheader("Flow map — one day, hour by hour")
+    st.caption(
+        "Source: `REPORTING.VW_INTERCHANGE_HOURLY` ⨝ `VW_BA_CENTROIDS` (approximate "
+        "footprint centers, M-23). Each arc is one reported flow, **blue end = "
+        "exporter → orange end = importer**; width scales with MWh (shared scale "
+        "across the day's hours, so scrubbing compares honestly). The day is "
+        "fetched once; the slider filters client-side."
+    )
+    ic_latest = query(
+        "select max(to_date(period)) as d from reporting.vw_interchange_hourly"
+    ).iloc[0]["d"]
+    if ic_latest is None:
+        st.info("No interchange data yet.")
+    else:
+        ic_latest = pd.to_datetime(ic_latest).date()
+        # Default to the latest *complete* day — the current day is mid-ingestion.
+        default_day = (
+            ic_latest - pd.Timedelta(days=1) if ic_latest >= today.date() else ic_latest
+        )
+        col_day, col_hour = st.columns([1, 2])
+        with col_day:
+            flow_day = st.date_input(
+                "Day", value=default_day, max_value=ic_latest, key="flows_day",
+            )
+        with col_hour:
+            flow_hour = st.slider("Hour (UTC)", 0, 23, 18, key="flows_hour")
+
+        day_flows = query(
+            f"select period, fromba, toba, flow_mwh "
+            f"from reporting.vw_interchange_hourly "
+            f"where to_date(period) = '{flow_day.isoformat()}' and flow_mwh > 0 "
+            # physical BAs only (M-23): aggregate flows would double-draw their
+            # members AND inflate the shared width scale below
+            f"and fromba in (select ba from reporting.vw_ba_centroids) "
+            f"and toba in (select ba from reporting.vw_ba_centroids)"
+        )
+        if day_flows.empty:
+            st.info(f"No flows reported on {flow_day}.")
+        else:
+            cent = query(
+                "select ba, ba_name, latitude, longitude from reporting.vw_ba_centroids"
+            )
+            day_flows["hour_utc"] = pd.to_datetime(day_flows["period"]).dt.hour
+            day_max = day_flows["flow_mwh"].max()
+            arcs = (
+                day_flows[day_flows["hour_utc"] == flow_hour]
+                .merge(cent.add_prefix("from_"), left_on="fromba", right_on="from_ba")
+                .merge(cent.add_prefix("to_"), left_on="toba", right_on="to_ba")
+            )
+            unmapped = day_flows["hour_utc"].eq(flow_hour).sum() - len(arcs)
+            if arcs.empty:
+                st.info(f"No mappable flows at {flow_hour:02d}:00 UTC on {flow_day}.")
+            else:
+                arcs["flow_mwh"] = arcs["flow_mwh"].round(0).astype(int)
+                arcs["width_px"] = 1 + 11 * arcs["flow_mwh"] / day_max
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Flows this hour", len(arcs))
+                m2.metric("Power moving", f"{arcs['flow_mwh'].sum():,.0f} MWh")
+                _top = arcs.loc[arcs["flow_mwh"].idxmax()]
+                m3.metric("Largest flow",
+                          f"{_top['fromba']} → {_top['toba']}",
+                          delta=f"{_top['flow_mwh']:,.0f} MWh", delta_color="off")
+
+                arc_layer = pdk.Layer(
+                    "ArcLayer",
+                    data=arcs[["fromba", "toba", "flow_mwh", "width_px",
+                               "from_longitude", "from_latitude",
+                               "to_longitude", "to_latitude"]],
+                    get_source_position=["from_longitude", "from_latitude"],
+                    get_target_position=["to_longitude", "to_latitude"],
+                    get_width="width_px",
+                    get_source_color=[76, 120, 168, 200],    # EXPORT_BLUE
+                    get_target_color=[245, 133, 24, 200],    # IMPORT_ORANGE
+                    pickable=True,
+                    auto_highlight=True,
+                )
+                point_layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=cent,
+                    get_position=["longitude", "latitude"],
+                    get_radius=18000,
+                    get_fill_color=[90, 90, 90, 160],
+                    pickable=False,  # only arcs carry the tooltip
+                )
+                deck = pdk.Deck(
+                    layers=[point_layer, arc_layer],
+                    initial_view_state=pdk.ViewState(
+                        latitude=39.5, longitude=-97.5, zoom=3.1, pitch=35,
+                    ),
+                    # Carto basemap — token-free, works on Community Cloud.
+                    map_provider="carto",
+                    map_style="light",
+                    tooltip={"text": "{fromba} → {toba}: {flow_mwh} MWh"},
+                )
+                st.pydeck_chart(deck, use_container_width=True)
+                note = (
+                    f"{len(arcs)} flows at {flow_hour:02d}:00 UTC on {flow_day}. "
+                    "Arcs run blue (exporter) → orange (importer); gray dots are "
+                    "balancing authorities. A pair showing arcs both ways is the two "
+                    "BAs disagreeing about the same flow — the asymmetry the dbt test "
+                    "surfaces (M-22)."
+                )
+                if unmapped > 0:
+                    note += (f" {unmapped} flow(s) hidden — BA code not in the "
+                             "centroids seed yet (coverage drift, M-23).")
+                st.caption(note)
+                with st.expander("Flows table (this hour)"):
+                    st.dataframe(
+                        arcs[["fromba", "toba", "flow_mwh"]]
+                        .sort_values("flow_mwh", ascending=False)
+                        .rename(columns={"fromba": "from", "toba": "to",
+                                         "flow_mwh": "MWh"}),
+                        hide_index=True, use_container_width=True,
+                    )
 
 # --- Data health tab ---------------------------------------------------------
 with tab_health:

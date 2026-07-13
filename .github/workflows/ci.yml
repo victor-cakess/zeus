@@ -70,6 +70,8 @@ jobs:
           - core
           - cicd
           - pipelines/eia
+          - pipelines/eia_region
+          - pipelines/eia_interchange
           - pipelines/noaa
           - pipelines/digest
           - pipelines/dbt

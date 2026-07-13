@@ -1,0 +1,17 @@
+version: 2
+
+sources:
+  - name: eia_interchange
+    database: "{{ target.database }}"
+    schema: EIA_INTERCHANGE
+    description: >
+      EIA hourly interchange-data landing (BA-to-BA power flows, signed), loaded
+      by the zeus-dev-eia-interchange-ingest Lambda's COPY INTO.
+    tables:
+      - name: eia_interchange_grid
+        description: >
+          Append-only EIA interchange-data landing table. One row per
+          (period, fromba, toba); value is signed MWh (positive = fromba exports
+          to toba). Both directions of every pair land — each BA reports its own
+          view of the flow. Duplicates from the rolling 7-day lookback overlap
+          are removed in stg_eia_interchange__flows (keep latest ingestion_date).

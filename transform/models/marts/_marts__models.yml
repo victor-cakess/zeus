@@ -186,6 +186,122 @@ models:
           arguments:
             combination_of_columns: [ba, date, forecaster]
 
+  - name: fct_interchange_hourly
+    description: >
+      Hourly interchange fact — stg_eia_interchange__flows materialized
+      incrementally so consumers stop recomputing the staging dedup over the
+      full landing table. One directed row per (period, fromba, toba); both
+      directions of a physical pair are distinct rows, each reported by its own
+      fromba (M-22). No intermediate layer — staging is already the consumption
+      grain (M-21). Each run merges a trailing 10-day window of periods:
+      revisions reach a period until it ages out of the 7-day ingestion lookback
+      (an 8-calendar-day span), +2 days operational slack (M-5, per M-21).
+    config:
+      materialized: incremental
+      incremental_strategy: merge
+      unique_key: ['period', 'fromba', 'toba']
+    columns:
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: fromba
+        description: >
+          Reporting balancing-authority code. EIA regional aggregates (US48,
+          CAL, TEX, …) report interchange too and land here — they pair only
+          with other aggregates (verified 2026-07-12), never with physical BAs;
+          consumers wanting physical flows filter on the ba_centroids seed (M-23).
+        data_tests:
+          - not_null
+          # Every mapped BA draws on the flow map; NEW unmapped codes surface
+          # here (warn — coverage drift is a finding, not a build failure;
+          # M-23). The known regional aggregates are deliberately unmapped, so
+          # they're scoped out to keep the warn signal meaningful.
+          - relationships:
+              name: fct_interchange_fromba_has_centroid
+              arguments:
+                to: ref('ba_centroids')
+                field: ba
+              config:
+                severity: warn
+                where: >
+                  fromba not in ('US48','CAL','CAR','CENT','FLA','MIDA','MIDW',
+                  'NE','NW','NY','SE','SW','TEN','TEX','CAN','MEX')
+      - name: fromba_name
+        description: Human-readable reporting-BA name.
+      - name: toba
+        description: >
+          Neighboring balancing-authority code — includes Canadian/Mexican
+          counterparties that are never a fromba, and (for aggregate frombas)
+          the CAN/MEX country aggregates.
+        data_tests:
+          - not_null
+          - relationships:
+              name: fct_interchange_toba_has_centroid
+              arguments:
+                to: ref('ba_centroids')
+                field: ba
+              config:
+                severity: warn
+                where: >
+                  toba not in ('US48','CAL','CAR','CENT','FLA','MIDA','MIDW',
+                  'NE','NW','NY','SE','SW','TEN','TEX','CAN','MEX')
+      - name: toba_name
+        description: Human-readable neighbor-BA name.
+      - name: flow_mwh
+        description: >
+          Power flow for the hour (MWh), signed: positive = fromba exports to
+          toba. Null hours occur (meter gaps).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [period, fromba, toba]
+      - interchange_asymmetry:
+          config:
+            severity: warn
+
+  - name: fct_net_position_hourly
+    description: >
+      Hourly net position per balancing authority — fct_interchange_hourly's
+      directed flows rolled up to (ba, period): imports, exports, and the signed
+      net. Uses each BA's OWN reports only (fromba = ba); mixing in the mirrored
+      counterparty rows would double-count (M-22). Sign convention matches
+      eia_region's TI: net_position_mwh positive = net exporter. EIA regional
+      aggregates appear as rows alongside their member BAs — consumers wanting
+      physical BAs only filter on the ba_centroids seed (M-23). Plain table
+      rebuilt from the materialized fact each run (M-5/M-21) — it never
+      re-reads landing.
+    config:
+      materialized: table
+    columns:
+      - name: ba
+        description: Balancing-authority code (the reporting fromba).
+        data_tests: [not_null]
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: exports_mwh
+        description: Sum of the hour's positive flows (MWh) — power sent to neighbors.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: imports_mwh
+        description: Sum of the hour's negative flows, sign-flipped (MWh) — power received.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: net_position_mwh
+        description: >
+          exports_mwh − imports_mwh (MWh, signed): positive = net exporter for
+          the hour, negative = net importer (M-22).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [ba, period]
+
   - name: fct_energy_daily
     description: >
       The cross-source daily mart: EIA generation rolled up to (ba, date) joined

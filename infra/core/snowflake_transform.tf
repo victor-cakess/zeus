@@ -111,6 +111,23 @@ resource "snowflake_grant_privileges_to_account_role" "transformer_noaa_table_se
   }
 }
 
+resource "snowflake_grant_privileges_to_account_role" "transformer_eia_interchange_schema_usage" {
+  account_role_name = snowflake_account_role.transformer.name
+  privileges        = ["USAGE"]
+  on_schema {
+    schema_name = "\"${snowflake_database.zeus_dev.name}\".\"${module.eia_interchange_landing.schema_name}\""
+  }
+}
+
+resource "snowflake_grant_privileges_to_account_role" "transformer_eia_interchange_table_select" {
+  account_role_name = snowflake_account_role.transformer.name
+  privileges        = ["SELECT"]
+  on_schema_object {
+    object_type = "TABLE"
+    object_name = "\"${snowflake_database.zeus_dev.name}\".\"${module.eia_interchange_landing.schema_name}\".\"${module.eia_interchange_landing.table_name}\""
+  }
+}
+
 resource "snowflake_grant_privileges_to_account_role" "transformer_fred_schema_usage" {
   account_role_name = snowflake_account_role.transformer.name
   privileges        = ["USAGE"]

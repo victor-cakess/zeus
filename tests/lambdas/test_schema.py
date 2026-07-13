@@ -101,6 +101,40 @@ def test_eia_region_normalize_missing_value_is_none(module_loader):
     _assert_schema_accepts(row, mod.SCHEMA)
 
 
+# --- EIA interchange-data (BA-to-BA flows) -------------------------------------------
+
+
+def test_eia_interchange_normalize_maps_dashed_keys(module_loader):
+    mod = _load(module_loader, "eia_interchange")
+    raw = {
+        "period": "2026-07-05T14",
+        "fromba": "PJM",
+        "fromba-name": "PJM Interconnection",
+        "toba": "MISO",
+        "toba-name": "Midcontinent Independent System Operator",
+        "value": "-321.0",
+        "value-units": "megawatthours",
+    }
+    row = mod.normalize_row(raw, date(2026, 7, 5))
+
+    assert row["period"] == datetime(2026, 7, 5, 14)   # 'T14' parsed to a datetime
+    assert row["fromba"] == "PJM"
+    assert row["fromba_name"] == "PJM Interconnection"  # dash → underscore
+    assert row["toba_name"] == "Midcontinent Independent System Operator"
+    assert row["value"] == -321.0                       # string → float, sign preserved
+    assert row["ingestion_date"] == date(2026, 7, 5)
+    _assert_schema_accepts(row, mod.SCHEMA)
+
+
+def test_eia_interchange_normalize_missing_value_is_none(module_loader):
+    # Flows can report null hours; a missing 'value' must land as None, not crash.
+    mod = _load(module_loader, "eia_interchange")
+    raw = {"period": "2026-07-05T14", "fromba": "PJM", "toba": "MISO"}
+    row = mod.normalize_row(raw, date(2026, 7, 5))
+    assert row["value"] is None
+    _assert_schema_accepts(row, mod.SCHEMA)
+
+
 # --- FRED --------------------------------------------------------------------------
 
 
