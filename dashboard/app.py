@@ -6,11 +6,12 @@ in any Lambda. Connects out to Snowflake as the least-privilege ZEUS_DEV_DASHBOA
 service user — SELECT on the REPORTING views only (never the marts or landing), on a
 dedicated XS warehouse capped by a resource monitor. It writes nothing.
 
-Run locally (from repo root) — key from a file:
+Run locally (from repo root) — key from a file; --with-requirements keeps local
+runs on the SAME pinned versions Community Cloud installs (see requirements.txt):
     export SNOWFLAKE_ACCOUNT=<org>-<account>
     export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/sf_dashboard.p8"
-    uv run --with streamlit --with snowflake-connector-python --with pandas \
-        --with numpy --with altair --with pydeck --no-project streamlit run dashboard/app.py
+    uv run --with-requirements dashboard/requirements.txt --no-project \
+        streamlit run dashboard/app.py
 
 On Streamlit Community Cloud the account + PEM private key come from st.secrets
 (SNOWFLAKE_ACCOUNT, SNOWFLAKE_PRIVATE_KEY); user/role/warehouse default to the

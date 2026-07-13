@@ -301,9 +301,12 @@ SNOWFLAKE_PRIVATE_KEY = """
 ```bash
 export SNOWFLAKE_ACCOUNT=<org>-<account>   # e.g. from `terraform -chdir=infra/core output -raw snowflake_account`
 export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/sf_dashboard.p8"
-uv run --with streamlit --with snowflake-connector-python --with pandas \
-    --with numpy --with altair --no-project streamlit run dashboard/app.py
+# --with-requirements = the same pinned versions Community Cloud installs
+uv run --with-requirements dashboard/requirements.txt --no-project \
+    streamlit run dashboard/app.py
 ```
+
+**Pinned dependencies (segfault, 2026-07-13):** `dashboard/requirements.txt` is fully pinned. Unpinned, Community Cloud resolved a bleeding-edge native stack (pandas 3.0.3 / numpy 2.5.1 / snowflake-connector 4.6.0 / cryptography 49) and the Streamlit process **segfaulted** on Cloud while the identical versions ran clean locally — an environment-specific native-ABI failure, the same class the Lambda requirements pin against. The pins hold the Lambda-proven connector/crypto trio + mature pandas/numpy/pyarrow lines. To bump: change the pin, run the app locally via `--with-requirements`, deploy, and watch the Cloud logs — never reopen the bounds.
 
 **Expired-session crash (`390114: Authentication token has expired`):** handled in `app.py` — the `@st.cache_resource` connection outlives Snowflake's ~4 h idle master token on Community Cloud, so `query()` catches session-expiry errnos (390111/390112/390114), drops the cached connection, reconnects, and retries once; the connection also sets `client_session_keep_alive`. If this traceback ever reappears, something bypassed `query()`.
 
