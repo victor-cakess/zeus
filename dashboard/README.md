@@ -43,8 +43,11 @@ Locally (from repo root) — key from a file, connecting as the dashboard user:
 export SNOWFLAKE_ACCOUNT=<org>-<account>
 export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/sf_dashboard.p8"
 
-uv run --with streamlit --with snowflake-connector-python --with pandas \
-    --with numpy --with altair --with pydeck --no-project streamlit run dashboard/app.py
+# --with-requirements = the same pinned versions Community Cloud installs —
+# local runs and prod stay on one stack (pins exist because unpinned resolution
+# segfaulted the Cloud process; see requirements.txt)
+uv run --with-requirements dashboard/requirements.txt --no-project \
+    streamlit run dashboard/app.py
 ```
 
 Opens at http://localhost:8501. `SNOWFLAKE_USER` / `ROLE` / `WAREHOUSE` / `DATABASE`

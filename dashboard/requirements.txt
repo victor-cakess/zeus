@@ -1,11 +1,24 @@
 # Dependencies for the standalone Streamlit dashboard (dashboard/app.py).
 # Streamlit Community Cloud installs from this file (it sits next to the entrypoint).
 # Kept separate from the project's pyproject.toml/uv.lock — the dashboard is NOT a
-# project dependency and never ships in a Lambda. cryptography comes pinned-compatible
-# via snowflake-connector-python (key-pair auth), so it's not listed separately.
-streamlit
-snowflake-connector-python
-pandas
-numpy
-altair
-pydeck
+# project dependency and never ships in a Lambda.
+#
+# PINNED after a Community Cloud segfault (2026-07-13): unpinned, the resolver
+# pulled a bleeding-edge native stack (pandas 3.0.3 / numpy 2.5.1 /
+# snowflake-connector 4.6.0 / cryptography 49) that segfaulted the Streamlit
+# process on Cloud while running clean locally — an environment-specific native
+# ABI issue, the same failure class the Lambda requirements already pin against.
+# The connector/crypto trio below is the Lambda-proven pair; pandas/numpy/pyarrow
+# are the mature lines. Bump deliberately (redeploy + watch the Cloud logs),
+# never by leaving bounds open. Run locally with the SAME pins:
+#   uv run --with-requirements dashboard/requirements.txt --no-project \
+#       streamlit run dashboard/app.py
+streamlit==1.59.1
+snowflake-connector-python==3.12.3
+cryptography==43.0.3
+pyOpenSSL==24.2.1
+pandas==2.3.3
+numpy==2.2.6
+pyarrow==19.0.1
+altair==6.2.2
+pydeck==0.9.3
