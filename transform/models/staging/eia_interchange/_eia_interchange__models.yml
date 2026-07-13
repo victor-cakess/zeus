@@ -1,0 +1,65 @@
+version: 2
+
+models:
+  - name: stg_eia_interchange__flows
+    description: >
+      EIA hourly BA-to-BA interchange flows, deduplicated on the lookback overlap
+      and standardized (value -> flow_mwh). Kept at native grain — one directed
+      row per (period, fromba, toba) — so staging stays zero-judgment; both
+      directions of a physical pair land as separate rows and reconciling them is
+      the interchange_asymmetry test's job (M-22), never a staging filter.
+      Counterparties outside the fan-out list (Canadian/Mexican BAs) appear only
+      as toba — their own fromba direction is never fetched.
+    columns:
+      - name: period
+        description: Hour, UTC (timestamp_ntz).
+        data_tests: [not_null]
+      - name: fromba
+        description: Reporting balancing-authority code. Same code set as stg_eia__generation.
+        data_tests: [not_null]
+      - name: fromba_name
+        description: Human-readable reporting-BA name.
+      - name: toba
+        description: >
+          Neighboring balancing-authority code the flow is measured against —
+          includes Canadian/Mexican counterparties that are never a fromba here.
+        data_tests: [not_null]
+      - name: toba_name
+        description: Human-readable neighbor-BA name.
+      - name: flow_mwh
+        description: >
+          Power flow for the hour, in megawatthours, signed: positive = fromba
+          exports to toba. Null hours occur (meter gaps).
+        # Surface (warn) raw out-of-range garbage per M-8; single-pair intertie
+        # flows are far smaller than BA totals, so the bound is tighter than
+        # eia_region's. QC-nulling (M-20) is deferred until this actually fires.
+        data_tests:
+          - dbt_utils.accepted_range:
+              name: eia_interchange_bounds_flow
+              arguments:
+                min_value: -50000
+                max_value: 50000
+                inclusive: true
+              config:
+                severity: warn
+      - name: value_units
+        description: Source units string (constant "megawatthours").
+        # Units contract — if EIA ever changes the unit, every MWh column
+        # downstream is wrong; fail loudly here.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["megawatthours"]
+      - name: ingestion_date
+        description: Date this row was ingested; used to pick the latest on dedup.
+    # Output assertion of the grain spec, plus: a BA must not report a flow to itself.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [period, fromba, toba]
+      - dbt_utils.expression_is_true:
+          name: eia_interchange_no_self_flows
+          arguments:
+            expression: "fromba <> toba"
+          config:
+            severity: warn

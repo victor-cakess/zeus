@@ -760,3 +760,119 @@ output; the staging bounds tests stay `warn` (surfacing).
   the cleaned **intermediate** output instead, and staging tests remain `warn` (surfacing).
 - The `US48`-exemption ceiling is duplicated across the three EIA models (one CASE each);
   accepted over a shared macro/model per the project's inline-clamp idiom (M-1/M-2).
+
+---
+
+## M-21. Interchange fact: staging materialized directly, no intermediate layer
+
+**Chosen:** `fct_interchange_hourly` is `stg_eia_interchange__flows` materialized
+incrementally (merge on `(period, fromba, toba)`, trailing 10-day window — the M-5
+pattern), read by every consumer. There is **no** `int_eia_interchange__*` view: the
+staging output is already the consumption grain, and the fact adds materialization
+only. QC-null bounds (M-20) are deferred: the staging `warn` bounds test
+(±50k MWh) has to actually fire on real data before an intermediate cleaning layer
+earns its existence.
+
+**Alternatives considered:**
+- **A pass-through `int_` view between stg and fact** (the eia/eia_region shape) —
+  empty ceremony: the int layer exists for business rules and grain changes, and
+  interchange has neither between staging and the fact.
+- **A view instead of an incremental fact** — every Flows-tab query would re-dedup
+  the ~23M-row landing table (the exact anti-pattern M-5 exists to prevent).
+
+**Why:** the layering rule assigns *jobs*, not mandatory hops — staging cleans,
+intermediate judges, marts materialize and serve. When a source needs no judgment,
+inserting an empty layer just adds a name to maintain.
+
+**Trade-offs:** if interchange ever needs a QC-null rule (M-20 style), it lands as a
+new int model and the fact re-points — a `--full-refresh` migration, deliberate and
+cheap at this volume.
+
+---
+
+## M-22. Interchange grain is directed; net position uses own reports only
+
+**Chosen:** the fact keeps one **directed** row per `(period, fromba, toba)` — both
+directions of a physical pair land as distinct rows, each the reporting BA's own
+view of the same flow (positive `flow_mwh` = fromba exports). Reconciling the two
+views is a *test*, not a filter: the `interchange_asymmetry` generic test groups by
+`(day, least(fromba,toba), greatest(fromba,toba))` and sums signed flows — a
+consistent pair sums to ~0 — flagging pairs that breach BOTH a relative (5% of the
+pair's gross flow) and an absolute (500 MWh/day) tolerance, `severity: warn`
+(M-8/M-18 policy: a reporting-quality finding, not a bug to clean). One-sided pairs
+(counterparties outside the fan-out list) are excluded — that residual is coverage,
+not asymmetry. `fct_net_position_hourly` rolls up to `(ba, period)` using each BA's
+**own reports only** (`fromba = ba`): `exports_mwh` (positive flows), `imports_mwh`
+(negative flows, sign-flipped), `net_position_mwh` (signed sum, positive = net
+exporter — the same sign convention as eia_region's TI).
+
+**Alternatives considered:**
+- **Dedupe to one row per undirected pair at staging/fact** — destroys the second
+  report, which is exactly the data the asymmetry test needs; also forces an
+  arbitrary "which report wins" judgment into staging (forbidden, M-8).
+- **Asymmetry test as a self-join on `(period, A, B)`** — a 23M×23M join re-run
+  every build, and each violation reports twice (A,B) and (B,A). The canonical-pair
+  GROUP BY is one scan and reports once.
+- **Net position averaging the two views of each flow** — hides the asymmetry the
+  test exists to surface, and makes a BA's net position depend on neighbors'
+  reporting quality.
+
+**Why:** both-directions-landing is the phase's analytical point (score the
+operators against each other); daily grain absorbs hourly metering-clock noise
+between independently reported series (M-18 precedent); dual tolerance keeps big
+interties and small taps on the same rule.
+
+**Trade-offs:** tolerances (5% / 500 MWh) validated against the first real data
+(2026-07-12, Jan 2026 + trailing week): **795 of 5,126 pair-days breach (15.5%)** —
+chronic offenders MISO↔PJM (every day, ~34k MWh/day mean residual; the two
+operators agree on direction but not magnitude — likely differing pseudo-tie
+treatment), BPAT↔PGE, MIDA↔MIDW. A real EIA-930 reporting finding, the M-18
+energy-balance story repeated cross-pair. Net position covers only fan-out BAs (a
+Canadian BA's net position is not computable from toba appearances alone —
+deliberate).
+
+---
+
+## M-23. BA centroids: a hand-curated seed, joined in the dashboard, never in marts
+
+**Chosen:** `seeds/ba_centroids.csv` — one row per **physical** balancing authority
+appearing in the interchange facets (75 codes, incl. Canadian/Mexican counterparties
+that are never a fromba), with hand-curated approximate footprint/operational-center
+coordinates. Tested: `ba` unique/not-null, coordinates inside tight North-America
+bounds (lat 24–60, lon −135–−60) at `error` severity — a typo should fail the build,
+not draw an arc into the ocean. Served 1:1 via `vw_ba_centroids` (M-13); the
+dashboard joins centroids against both arc ends **in pandas**. EIA regional
+aggregates (US48, CAL, TEX, CAN, MEX, …) are deliberately absent: they are rollups
+of the physical rows and would double-draw flows on a map. The flow map renders
+rows with `flow_mwh > 0` — one arc per physical flow, exporter→importer; a
+doubly-positive pair renders two arcs, which is the asymmetry finding made visible.
+
+**Alternatives considered:**
+- **Centroids computed from the EIA/HIFLD control-area shapefile** — more precise,
+  but adds a geopandas one-off pipeline + BA-code matching for coordinates whose
+  only job is anchoring map arcs; approximate centers are visually identical at
+  continental zoom.
+- **Joining centroids into `fct_interchange_hourly` / `fct_net_position_hourly`**
+  (the ROADMAP draft) — four float columns × 23M rows to serve a 75-row lookup, and
+  the arc map needs BOTH ends' coordinates anyway, so the mart join wouldn't even
+  spare the dashboard its merge. Reporting views stay strict 1:1 (M-13).
+- **An "international" bucket instead of real foreign centroids** — cheaper to
+  curate but collapses HQT/IESO/BCHA/AESO/MHEB/SPC/NBSO/CEN arcs into one fake
+  point; cross-border flows are among the most interesting on the map.
+
+**Why:** the seed is reference data with a testable contract (dbt's exact job for
+static CSVs); pandas-joining a 75-row table against a one-day slice is presentation
+logic, not modeling; keeping aggregates out keeps every map/heatmap/bar consumer
+from double-counting without per-consumer filters.
+
+**Trade-offs:** coordinates are representative, not authoritative — documented in
+the seed yml. New counterparty codes appear as `relationships` `warn`s on the fact
+(coverage drift surfaces without failing the build; the 16 known aggregates are
+scoped out of the test so the signal stays meaningful) and their arcs drop with a
+caption count until curated. The seed carries codes beyond the current fan-out list
+(e.g. `AEC`, `SPA`, `WACM`) so toba-side arcs and any future fan-out widening need
+no seed change. The seed also doubles as the **physical-BA registry**: aggregates
+DO report interchange (verified 2026-07-12 — they pair only with other aggregates,
+never with physical BAs), they land like everything else (append-only truth, the
+eia_region US48 precedent), and consumers wanting physical flows semi-join this
+seed — the dashboard's bar/heatmap do exactly that.

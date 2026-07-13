@@ -1,6 +1,6 @@
 # Zeus
 
-A serverless **energy-data platform** on AWS + Snowflake. One Step Functions state machine runs the whole daily flow: four ingestion pipelines — **EIA** (hourly fuel-type generation), **EIA region** (hourly demand, day-ahead demand forecast, net generation, and interchange per balancing authority), **NOAA** (daily weather summaries), and **FRED** (national energy prices) — run in parallel, each landing raw JSON + a curated Parquet in S3 and `COPY`ing it into a Snowflake landing table; a **dbt** container-image Lambda then builds and tests the modeled layers (staging → intermediate → marts); finally a **digest** Lambda emails one combined run-report across all sources plus the dbt run. The digest always runs, even when an upstream step fails.
+A serverless **energy-data platform** on AWS + Snowflake. One Step Functions state machine runs the whole daily flow: five ingestion pipelines — **EIA** (hourly fuel-type generation), **EIA region** (hourly demand, day-ahead demand forecast, net generation, and interchange per balancing authority), **EIA interchange** (hourly BA-to-BA power flows, signed), **NOAA** (daily weather summaries), and **FRED** (national energy prices) — run in parallel, each landing raw JSON + a curated Parquet in S3 and `COPY`ing it into a Snowflake landing table; a **dbt** container-image Lambda then builds and tests the modeled layers (staging → intermediate → marts); finally a **digest** Lambda emails one combined run-report across all sources plus the dbt run. The digest always runs, even when an upstream step fails.
 
 **Live dashboard: [zeusapplication.streamlit.app](https://zeusapplication.streamlit.app)** — the platform's serving layer, read straight from the `REPORTING` views ([screenshots below](#dashboard)).
 
@@ -27,6 +27,7 @@ flowchart TB
             direction LR
             eia["EIA Lambda<br/>hourly fuel-type"]
             eiar["EIA region Lambda<br/>demand + DA forecast"]
+            eiai["EIA interchange Lambda<br/>BA-to-BA flows"]
             noaa["NOAA Lambda<br/>daily weather"]
             fred["FRED Lambda<br/>energy prices"]
         end
@@ -37,9 +38,10 @@ flowchart TB
 
     eia -->|raw JSON + curated Parquet| s3[("S3<br/>raw/ · curated/ · reports/")]
     eiar --> s3
+    eiai --> s3
     noaa --> s3
     fred --> s3
-    s3 -->|COPY INTO| sf[("Snowflake landing<br/>EIA_GRID · EIA_REGION_GRID · NOAA_GRID · FRED_GRID")]
+    s3 -->|COPY INTO| sf[("Snowflake landing<br/>EIA_GRID · EIA_REGION_GRID · EIA_INTERCHANGE_GRID · NOAA_GRID · FRED_GRID")]
     sf -->|read| dbt
     dbt -->|staging → intermediate → marts| marts[("Snowflake marts<br/>fct_* tables")]
 
@@ -59,7 +61,7 @@ How code ships (distinct from the runtime view above). dbt/transform PRs are fir
 
 ### Data model
 
-Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). The cross-source joins in the pipeline live inside `fct_energy_daily`, both LEFT on `(ba, date)`: EIA generation ↔ NOAA weather (M-4) and ↔ EIA-region demand (M-14) — the sources are deliberately keyed on the same balancing-authority code so these joins work. `fct_demand_accuracy` scores the operators' day-ahead forecast against actual demand per BA-day, long on a `forecaster` dimension (M-15). `fct_fuel_prices_daily` (FRED) is **standalone** — national (no `ba`), not joined to the other marts; a consumer *can* join it to `fct_energy_daily` on `date`, but the pipeline doesn't (M-12). Grains are the `PK` columns.
+Lineage + join keys for the dbt layer, shown `landing → intermediate → marts` (the `stg_*` views are pure 1:1 dedup+rename and omitted here — see `dbt docs serve` for the full model-by-model lineage with column docs). The cross-source joins in the pipeline live inside `fct_energy_daily`, both LEFT on `(ba, date)`: EIA generation ↔ NOAA weather (M-4) and ↔ EIA-region demand (M-14) — the sources are deliberately keyed on the same balancing-authority code so these joins work. `fct_demand_accuracy` scores the operators' day-ahead forecast against actual demand per BA-day, long on a `forecaster` dimension (M-15). `fct_interchange_hourly` keeps the **directed** BA-to-BA flows (both directions of every pair — each BA's own report; a warn-severity `interchange_asymmetry` test compares them, M-22) and rolls up to per-BA imports/exports/net in `fct_net_position_hourly`; the hand-curated `ba_centroids` seed anchors the dashboard's flow map and doubles as the physical-BA registry (M-23). `fct_fuel_prices_daily` (FRED) is **standalone** — national (no `ba`), not joined to the other marts; a consumer *can* join it to `fct_energy_daily` on `date`, but the pipeline doesn't (M-12). Grains are the `PK` columns.
 
 ```mermaid
 erDiagram
@@ -75,6 +77,13 @@ erDiagram
         string respondent "balancing authority"
         string type "D / DF / NG / TI"
         float value "MWh (TI signed)"
+        date ingestion_date
+    }
+    EIA_INTERCHANGE_GRID {
+        timestamp period "hour, UTC"
+        string fromba "reporting BA"
+        string toba "neighbor BA"
+        float value "MWh, signed (positive = fromba exports)"
         date ingestion_date
     }
     NOAA_GRID {
@@ -140,6 +149,24 @@ erDiagram
         float bias_pct "signed"
         int hours_scored
     }
+    FCT_INTERCHANGE_HOURLY {
+        timestamp period PK
+        string fromba PK
+        string toba PK
+        float flow_mwh "signed; directed, both directions land (M-22)"
+    }
+    FCT_NET_POSITION_HOURLY {
+        string ba PK
+        timestamp period PK
+        float exports_mwh
+        float imports_mwh
+        float net_position_mwh "positive = net exporter (M-22)"
+    }
+    BA_CENTROIDS {
+        string ba PK "seed — physical-BA registry (M-23)"
+        float latitude
+        float longitude
+    }
     FCT_ENERGY_DAILY {
         string ba PK "join key"
         date date PK "join key"
@@ -161,6 +188,9 @@ erDiagram
     INT_EIA_REGION__DEMAND_HOURLY ||--|| FCT_DEMAND_HOURLY : "materialize incremental (M-5/M-16)"
     FCT_DEMAND_HOURLY }o--|| FCT_DEMAND_ACCURACY : "score DF vs D per BA-day (M-15)"
     FCT_DEMAND_HOURLY }o--o| FCT_ENERGY_DAILY : "LEFT JOIN daily sums on (ba, date)"
+    EIA_INTERCHANGE_GRID }o--|| FCT_INTERCHANGE_HOURLY : "stg dedup, materialize incremental (M-21)"
+    FCT_INTERCHANGE_HOURLY }o--|| FCT_NET_POSITION_HOURLY : "own reports rolled up per (ba, period) (M-22)"
+    BA_CENTROIDS ||--o{ FCT_NET_POSITION_HOURLY : "physical-BA filter at consumption (M-23)"
     NOAA_GRID }o--|| INT_NOAA__WEATHER_DAILY : "station -> BA mean, daily (M-3)"
     FRED_GRID }o--|| INT_FRED__PRICES_DAILY : "wide daily LOCF spine (M-10)"
     INT_EIA__GENERATION_HOURLY ||--|| FCT_GENERATION_HOURLY : "materialize incremental (M-5)"
@@ -168,6 +198,12 @@ erDiagram
     INT_NOAA__WEATHER_DAILY }o--o| FCT_ENERGY_DAILY : "LEFT JOIN on (ba, date) (M-4)"
     INT_FRED__PRICES_DAILY ||--|| FCT_FUEL_PRICES_DAILY : "materialize as table (standalone, M-12)"
 ```
+
+The full model-by-model DAG, as dbt sees it — every landing source through staging, intermediate, marts, and the reporting views the dashboard reads (plus the `ba_centroids` seed):
+
+![dbt lineage graph — sources → staging → intermediate → marts → reporting](docs/screenshots/lineage.png)
+
+<sub>Generated by dbt docs — regenerate with `dbt docs generate && dbt docs serve` from `transform/` (needs `SNOWFLAKE_ACCOUNT` + the transformer key; see RUNBOOK). Column docs and every test live in the same site.</sub>
 
 ## Dashboard
 
@@ -185,6 +221,10 @@ The serving layer in action — **[zeusapplication.streamlit.app](https://zeusap
 
 <sub>**Operators** — the operator's own day-ahead demand forecast scored against actual demand per BA-day: daily WAPE and signed bias (M-15).</sub>
 
+![Flow map — BA-to-BA interchange arcs with hour slider](docs/screenshots/flow.png)
+
+<sub>**Flows** — one hour of BA-to-BA interchange: each arc runs blue (exporter) → orange (importer), width scaled to MWh; a day picker + hour slider scrub one pre-fetched day client-side (M-22/M-23).</sub>
+
 ## Tech stack
 
 | Concern | Choice |
@@ -201,21 +241,21 @@ The serving layer in action — **[zeusapplication.streamlit.app](https://zeusap
 
 ## Project status
 
-- **Ingestion (live):** EIA (71 balancing authorities), EIA region-data (same 71 BAs — hourly demand, day-ahead demand forecast, net generation, interchange; shares the EIA API key), NOAA (14 BAs → weather stations), FRED (15 national price series). Each daily, fault-tolerant per unit.
-- **Modeling (live):** dbt — **21 models** (4 staging + 5 intermediate + 6 marts + 6 reporting views), **103 tests**. Includes the demand/forecast-accuracy layer over region-data (`fct_demand_hourly`, `fct_demand_accuracy` — WAPE/bias per BA-day) base-65°F degree days (`hdd`/`cdd`) on `fct_energy_daily`, and a warn-severity energy-balance test (`D = NG − TI` per BA-day — it surfaces real EIA-930 reporting gaps, see M-18); interchange analytics come next.
+- **Ingestion (live):** EIA (71 balancing authorities), EIA region-data (same 71 BAs — hourly demand, day-ahead demand forecast, net generation, interchange; shares the EIA API key), EIA interchange-data (81 frombas — directed BA-to-BA flows, both directions land; same shared key, client on the shared `eia_api.py`), NOAA (14 BAs → weather stations), FRED (15 national price series). Each daily, fault-tolerant per unit.
+- **Modeling (live):** dbt — **27 models** (5 staging + 5 intermediate + 8 marts + 9 reporting views) + the first seed (`ba_centroids`), **129 tests**. Includes the demand/forecast-accuracy layer over region-data (`fct_demand_hourly`, `fct_demand_accuracy` — WAPE/bias per BA-day), base-65°F degree days (`hdd`/`cdd`) on `fct_energy_daily`, the interchange flow layer (`fct_interchange_hourly` directed, `fct_net_position_hourly` per-BA imports/exports/net — M-21/M-22), and two warn-severity physics tests that surface real EIA-930 reporting gaps: energy balance (`D = NG − TI` per BA-day, M-18) and interchange asymmetry (the two sides of a flow disagree — MISO↔PJM by ~34 GWh/day, every day; M-22).
 - **Orchestration (live):** one Step Functions state machine on a 07:00 UTC daily cron; the digest always runs, any failure alerts via SNS and marks the execution Failed.
 - **CI/CD (live):** offline gates (gitleaks + `dbt parse` + an offline Lambda unit suite (`pytest`) + `terraform fmt/validate`), a zero-copy clone CI for dbt PRs, and a decoupled dbt-image CD via GitHub OIDC.
-- **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a public Streamlit dashboard ([zeusapplication.streamlit.app](https://zeusapplication.streamlit.app), source in [`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)). Five tabs, including the **Operators** forecast-accuracy league (WAPE/bias per BA).
-- **History:** EIA 2017→, NOAA 2010→, FRED 2014→ backfilled; EIA region-data backfilled 2019→ (the API route's full availability — its `startPeriod` is 2019-01-01).
+- **Serving (live):** a `REPORTING` schema of read-only views over the marts, read by a public Streamlit dashboard ([zeusapplication.streamlit.app](https://zeusapplication.streamlit.app), source in [`dashboard/`](dashboard/)) as a least-privilege role (`ZEUS_DEV_DASHBOARD`) on a resource-monitor-capped warehouse — the governed public surface ([ADR #17](ADR.md#17-public-dashboard-a-governed-read-only-serving-layer-reporting-views--leaf-role--capped-warehouse)). Six tabs, including the **Operators** forecast-accuracy league (WAPE/bias per BA) and the **Flows** interchange visuals (net importer/exporter bar, hour-of-day heatmap, and a pydeck arc map with an hour slider).
+- **History:** EIA 2017→, NOAA 2010→, FRED 2014→ backfilled; EIA region-data and interchange-data backfilled 2019→ (the API routes' full availability — `startPeriod` is 2019-01-01 for both).
 
 ## Repository layout
 
 ```
 infra/        # Terraform: core (shared) + per-pipeline roots + orchestration + cicd; two shared modules
 src/
-  shared/     # importable by every Lambda (paths, s3_io, ssm, sns, snowflake_io, time_window, report, ingest)
-  lambdas/    # eia/noaa/fred ingest + digest + dbt runner (container image)
-transform/    # dbt project (staging + intermediate + marts, tests, profiles.yml)
+  shared/     # importable by every Lambda (paths, s3_io, ssm, sns, snowflake_io, time_window, eia_api, report, ingest)
+  lambdas/    # eia/eia_region/eia_interchange/noaa/fred ingest + digest + dbt runner (container image)
+transform/    # dbt project (staging + intermediate + marts + reporting, seeds, tests, profiles.yml)
 backfill/     # one-off historical backfill scripts per source
 docs/         # architecture / deploy diagrams (diagram-as-code)
 .github/      # CI/CD workflows
@@ -232,7 +272,7 @@ uv sync --group dev                      # Python deps + dev tooling
 
 # Terraform apply order: core → pipeline roots → orchestration LAST
 cd infra/core && terraform apply         # shared S3 + SNS + Snowflake warehouse/db + landing stacks
-# then each infra/pipelines/<eia|noaa|fred|digest|dbt> root, then:
+# then each infra/pipelines/<eia|eia_region|eia_interchange|noaa|fred|digest|dbt> root, then:
 cd infra/pipelines/orchestration && terraform apply
 
 # Run the whole daily pipeline end-to-end (what the cron does)
@@ -244,7 +284,7 @@ Secrets are never in code or state: each loader's public key is in Terraform; pr
 
 ## Key architecture decisions
 
-Highlights — the full set (18 cross-cutting + per-pipeline) is in [ADR.md](ADR.md).
+Highlights — the full set (19 cross-cutting + per-pipeline) is in [ADR.md](ADR.md).
 
 - **[One fault-tolerant Step Functions state machine](ADR.md#14-daily-orchestration-one-step-functions-state-machine-over-the-pipeline-lambdas)** — parallel ingest → dbt → digest, with per-branch catches so the digest always runs and any failure alerts (#14).
 - **[dbt-core in a container Lambda, not dbt Cloud](ADR.md#dbt-1-runner-a-container-image-lambda)** — one orchestration model, no vendor lock-in; includes the [`/dev/shm` multiprocessing workaround](ADR.md#dbt-3-lambda-runtime-detour-worth-recording-no-devshm) (DBT-1, DBT-3).

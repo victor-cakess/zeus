@@ -39,3 +39,16 @@ models:
     reporting:
       +materialized: view
       +schema: reporting
+
+seeds:
+  zeus:
+    # Seed reference data lands in its own schema (generate_schema_name uses the
+    # custom name verbatim). +schema is MANDATORY here: the prod dbt Lambda sets
+    # no SNOWFLAKE_SCHEMA env var, so an unconfigured seed would land in
+    # ZEUS_DEV.PUBLIC.
+    +schema: seeds
+    ba_centroids:
+      # Explicit floats so CSV type inference can't bite.
+      +column_types:
+        latitude: float
+        longitude: float

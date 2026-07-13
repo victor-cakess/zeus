@@ -2,14 +2,15 @@
 
 Demo consumption layer over the Zeus dbt models — a single Streamlit app that reads
 the **`REPORTING.VW_*` views only** (never the marts or the landing schemas) and
-renders charts across five tabs. Read-only; it writes nothing.
+renders charts across six tabs. Read-only; it writes nothing.
 
 Like `docs/architecture.py`, this is **not** a project dependency: it's pulled in
 on demand via `uv run --with`, so it never ships in any Lambda.
 
 A **sidebar** holds the global controls — balancing authority + date range — that
-drive the Generation, Prices, and Operators tabs; the Weather tab keeps its own
-season + year picker. A **data-health banner** at the top shows per-source freshness and coverage.
+drive the Generation, Prices, Operators, and Flows tabs; the Weather tab keeps its
+own season + year picker, and the flow map has its own day + hour controls. A
+**data-health banner** at the top shows per-source freshness and coverage.
 
 ## Governance — views-only, least privilege
 
@@ -43,7 +44,7 @@ export SNOWFLAKE_ACCOUNT=<org>-<account>
 export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/sf_dashboard.p8"
 
 uv run --with streamlit --with snowflake-connector-python --with pandas \
-    --with numpy --with altair --no-project streamlit run dashboard/app.py
+    --with numpy --with altair --with pydeck --no-project streamlit run dashboard/app.py
 ```
 
 Opens at http://localhost:8501. `SNOWFLAKE_USER` / `ROLE` / `WAREHOUSE` / `DATABASE`
@@ -74,6 +75,11 @@ dashboard identity above, so nothing else is required. See RUNBOOK.md → dashbo
 - **Forecast error over time** — the selected BA's daily WAPE (blue, always ≥ 0) and signed bias (red; positive = over-forecast, M-15) on one axis, with a zero rule.
 - **Does temperature break the forecast?** — daily WAPE vs `tavg` (`vw_energy_daily`); extreme temperatures are the hard days, so a U-shape is expected and no fit line is drawn.
 
+**Flows tab** (BA-to-BA interchange — Phase 2's source + the 3b flow analytics)
+- **Net importers vs net exporters** — `vw_net_position_hourly`, net interchange summed over the selected range, one diverging bar per BA (blue = net exporter, orange = net importer — the polarity pair every visual on this tab shares). Physical BAs only: EIA regional aggregates (US48, CAL, TEX, …) also report interchange but double-count their members, so the charts semi-join `vw_ba_centroids` — the hand-curated centroids seed doubles as the physical-BA registry (M-23).
+- **The daily rhythm** — BA × hour-of-day heatmap of average net position, each BA scaled to its own peak so a small BA's shape isn't washed out by a giant's magnitudes (real MWh in the tooltip). Solar BAs flip visibly: midday export hump, evening import ramp.
+- **Flow map** — `vw_interchange_hourly` ⨝ `vw_ba_centroids`, a [pydeck](https://deckgl.readthedocs.io/) `ArcLayer` on a token-free Carto basemap: one arc per reported flow, blue (exporter) end → orange (importer) end, width scaled to MWh against the day's largest physical flow. A day picker + an **hour slider (0–23)** scrub one pre-fetched day client-side — scrubbing never re-queries. A pair drawing arcs both ways is the two BAs *disagreeing* about the same physical flow — the finding the `interchange_asymmetry` dbt test surfaces (M-22), rendered instead of smoothed. Data is each BA's **own** reports, so totals are as-reported-by-exporters, not reconciled truth.
+
 **Data health tab** — per-source freshness, BA coverage on the latest day, the last fully-complete day, and the exclusions the weather charts apply (partial days + ~3-day weather lag).
 
-Charts are [Altair](https://altair-viz.github.io/) (fit lines, tooltips, dual axes); simple time series stay Streamlit built-ins.
+Charts are [Altair](https://altair-viz.github.io/) (fit lines, tooltips, dual axes) plus one [pydeck](https://deckgl.readthedocs.io/) map; simple time series stay Streamlit built-ins.

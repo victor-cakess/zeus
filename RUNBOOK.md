@@ -22,7 +22,8 @@ uv run pytest tests/shared/test_ingest.py -v   # one module, verbose
 # Terraform — core (S3 + SNS + Snowflake warehouse/db + per-source landing stacks); apply this first.
 # Requires in terraform.tfvars (gitignored): role = "ACCOUNTADMIN" (to create the
 # storage integrations + service users) and one loader RSA public-key body per source
-# (eia_loader_public_key, noaa_loader_public_key, fred_loader_public_key). Generate each key-pair once, e.g.:
+# (eia_loader_public_key, eia_region_loader_public_key, eia_interchange_loader_public_key,
+# noaa_loader_public_key, fred_loader_public_key). Generate each key-pair once, e.g.:
 #   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out sf_noaa_loader.p8 -nocrypt
 #   openssl rsa -in sf_noaa_loader.p8 -pubout -out sf_noaa_loader.pub   # paste body into tfvars
 # (*.p8 and *.pub are gitignored.) Same pattern for the transformer (sf_transformer.p8 →
@@ -82,6 +83,19 @@ aws s3 ls "s3://zeus-dev-energy-data/raw/eia/ingestion_year=$(date -u +%Y)/inges
 # Verify rows landed in Snowflake (Snowsight or any SQL client)
 #   SELECT min(period), max(period), count(*) FROM ZEUS_DEV.EIA.EIA_GRID;
 
+# Terraform — EIA region-data / EIA interchange pipelines (same shape as EIA, minus
+# the api-key resource: both CONSUME /zeus/dev/eia/api_key — the eia root owns it —
+# and author only their own loader key). Shown for interchange; region-data is identical
+# with the eia_region names.
+cd infra/pipelines/eia_interchange
+terraform init && terraform apply
+aws ssm put-parameter --name /zeus/dev/snowflake/eia_interchange_loader_private_key \
+  --value "$(cat sf_eia_interchange_loader.p8)" --type SecureString --overwrite
+aws lambda invoke --function-name zeus-dev-eia-interchange-ingest \
+  --payload '{"units":["PJM","MISO"]}' --cli-binary-format raw-in-base64-out \
+  /tmp/eia-interchange-out.json && cat /tmp/eia-interchange-out.json
+#   then: SELECT min(period), max(period), count(*) FROM ZEUS_DEV.EIA_INTERCHANGE.EIA_INTERCHANGE_GRID;
+
 # Terraform — NOAA pipeline (same shape as EIA; uses the noaa loader key only)
 cd infra/pipelines/noaa
 terraform init && terraform apply
@@ -126,13 +140,22 @@ gh workflow run dbt-deploy.yml --ref dev
 #   docker push <acct>.dkr.ecr.sa-east-1.amazonaws.com/zeus-dev-dbt-run:$(git rev-parse HEAD)
 #   aws lambda update-function-code --function-name zeus-dev-dbt-run --image-uri <same tag>
 
+# Local dbt (manual runs + the docs/lineage site) — env-var driven profile, key-pair auth
+cd transform
+export SNOWFLAKE_ACCOUNT=<org>-<account>
+export SNOWFLAKE_PRIVATE_KEY_FILE="$(pwd)/../sf_transformer.p8"
+uv run --with dbt-snowflake --no-project dbt build          # models + tests against ZEUS_DEV
+uv run --with dbt-snowflake --no-project dbt docs generate  # manifest + catalog → target/
+uv run --with dbt-snowflake --no-project dbt docs serve --port 8081  # lineage graph + column docs
+# (docs serve re-parses the project, so it needs the same env vars as generate.)
+
 # One-time CD setup (infra/cicd): OIDC provider + deploy role, then publish the role ARN
 cd infra/cicd && terraform init && terraform apply
 gh variable set AWS_DEPLOY_ROLE_ARN --body "$(terraform -chdir=infra/cicd output -raw deploy_role_arn)"
 
 # Terraform — orchestration (the daily state machine). Apply LAST: it consumes the
-# ingest (eia/eia_region/noaa/fred) + digest/dbt roots' outputs via remote state and
-# fails to plan until they exist.
+# ingest (eia/eia_region/eia_interchange/noaa/fred) + digest/dbt roots' outputs via
+# remote state and fails to plan until they exist.
 cd infra/pipelines/orchestration
 terraform init && terraform apply
 
@@ -155,6 +178,9 @@ uv run python backfill/eia/run.py  extract   --start 2017-01-01       # then: tr
 EIA_API_KEY=$(aws ssm get-parameter --name /zeus/dev/eia/api_key --with-decryption \
   --query Parameter.Value --output text) \
   uv run python backfill/eia_region/run.py extract --start 2019-01-01 # region-data API route serves 2019-01-01→ (route startPeriod; pre-2019 EIA-930 is bulk-CSV only); then: transform, then snowflake_load.py (sf_eia_region_loader.p8)
+EIA_API_KEY=$(aws ssm get-parameter --name /zeus/dev/eia/api_key --with-decryption \
+  --query Parameter.Value --output text) \
+  uv run python backfill/eia_interchange/run.py extract --start 2019-01-01 # interchange route: same 2019-01-01 startPeriod; then: transform, then snowflake_load.py (sf_eia_interchange_loader.p8). After the COPY, the incremental fact needs `dbt build --full-refresh --select fct_interchange_hourly+` (history sits outside the 10-day merge window).
 uv run python backfill/noaa/run.py extract   --start 2010-01-01       # one batched request per BA-year
 uv run python backfill/noaa/run.py transform --start 2010-01-01       # per-day curated Parquet (S3-only, parallel)
 SNOWFLAKE_ACCOUNT=<org-account> SNOWFLAKE_PRIVATE_KEY_FILE=sf_noaa_loader.p8 \
@@ -189,7 +215,7 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 
 - **Per-invocation steps:** (1) fan out the per-BA fetch across a `ThreadPoolExecutor` (`MAX_WORKERS` env var, default 20), writing one raw JSON per BA; (2) read back the day's raw partition and consolidate to one Snappy Parquet in curated; (3) `COPY INTO ZEUS_DEV.EIA.EIA_GRID` from the external stage; (4) write `run_report.json`. It does **not** email — the digest does.
 - **Secrets:** EIA API key in SSM `/zeus/dev/eia/api_key`; Snowflake loader private key in SSM `/zeus/dev/snowflake/eia_loader_private_key` (both `SecureString`). Lambda role has scoped `ssm:GetParameter` + `kms:Decrypt` on both. Each is fetched per run before it's needed.
-- **Shared-key rate budget:** the EIA and EIA-region Lambdas share this API key inside the same Parallel state — ~150 requests per daily run combined (≈1 paginated request per BA per source) against EIA's published default of 5,000/hr. The API sits behind an api-umbrella proxy and returns no rate-limit headers, so the account's actual limit can't be confirmed programmatically; the published default is the working assumption (checked 2026-07-09). Backfills self-throttle and never overlap the 07:00 UTC cron.
+- **Shared-key rate budget:** the EIA, EIA-region, and EIA-interchange Lambdas share this API key inside the same Parallel state — ~225 requests per daily run combined (≈1 paginated request per unit per source) against EIA's published default of 5,000/hr. The API sits behind an api-umbrella proxy and returns no rate-limit headers, so the account's actual limit can't be confirmed programmatically; the published default is the working assumption (checked 2026-07-09; re-checked at the third consumer 2026-07-12). Backfills self-throttle and never overlap the 07:00 UTC cron.
 - **Raw output:** `s3://zeus-dev-energy-data/raw/eia/ingestion_year=YYYY/ingestion_month=MM/ingestion_day=DD/<unit>.json`. Append-only, immutable; rolling 7-day lookback per run. Overlapping windows are intentional and de-duplicated downstream at query time on `(period, respondent, fueltype)`.
 - **Curated output:** `s3://zeus-dev-energy-data/curated/eia/.../eia_grid.parquet`. Single Snappy-compressed Parquet per day. **Reports:** `s3://zeus-dev-energy-data/reports/eia/.../run_report.json` — succeeded + skipped units (with reasons).
 - **Per-BA fault tolerance:** a BA that errors or returns 0 rows is recorded as `skipped` and the run continues, consolidating whatever landed. Only a **total outage** (0 rows consolidated) raises `ValueError` and fails the invocation. Inside a fetch, the client retries HTTP 502/503/504 with backoff (10 s, 20 s, 30 s) before giving up and skipping the BA.
@@ -203,6 +229,15 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 - **Outputs:** `raw/eia_region/.../<ba>.json`, `curated/eia_region/.../eia_region_grid.parquet`, `reports/eia_region/.../run_report.json` — same partition scheme as EIA. Rolling 7-day lookback; deduped downstream on `(period, respondent, type)` keep latest `ingestion_date`.
 - **Fault tolerance / alerting:** same contract as EIA (per-BA skip, total-outage `ValueError`, branch Catch → digest → `CheckFailures`). Generation-only BAs returning no D/DF rows is expected data shape, not an error.
 - **Observed performance:** TBD after first production runs (expect ≈ EIA's profile; ~4 series × 24 h × 7 d ≈ 675 rows/BA/run).
+
+### EIA interchange-data daily ingestion
+
+- **Per-invocation steps:** identical to EIA (same shared `run_ingest` orchestration); target table `ZEUS_DEV.EIA_INTERCHANGE.EIA_INTERCHANGE_GRID`. One request-loop per `fromba` returns signed flows to all of that BA's neighbors; grain `(period, fromba, toba)`. Client = a thin route/facet wrapper over `src/shared/eia_api.py` (ADR #19).
+- **Secrets:** **shares the EIA API key** (SSM `/zeus/dev/eia/api_key` — owned by the eia root's Terraform; this root only reads it); own Snowflake loader key in SSM `/zeus/dev/snowflake/eia_interchange_loader_private_key`.
+- **Outputs:** `raw/eia_interchange/.../<ba>.json`, `curated/eia_interchange/.../eia_interchange_grid.parquet`, `reports/eia_interchange/.../run_report.json` — same partition scheme as EIA. Rolling 7-day lookback; deduped downstream on `(period, fromba, toba)` keep latest `ingestion_date`.
+- **Fault tolerance / alerting:** same contract as EIA (per-unit skip, total-outage `ValueError`, branch Catch → digest → `CheckFailures`). Expected skips: `PSCO` reported continuously 2019 → late March 2026 and then went dark (a live reporting lapse the daily skip surfaces — exactly what the mechanism is for), and most of the 10 interchange-only BAs (`AEC…WWA`, EIA-INTERCHANGE-2) are historical — they carry 2019+ history but report nothing current. Both show as skipped in the daily digest; that's data shape, not failure.
+- **Observed performance:** first full 81-unit smoke (2026-07-12): ~45k rows/run, well inside the 300 s timeout. Regional aggregates (US48, CAL, …) land alongside physical BAs by design — consumers filter via the `ba_centroids` seed (M-23).
+- **Backfill (2019-01-01 → 2026-07-12, ran 2026-07-12):** extract ~62 min at concurrency 10 (206,558 raw files, 22.3M rows, 0 failures), transform ~29 min (2,718 parquets), whole-stage COPY = **22,071,919 rows**. Then `dbt build --full-refresh --select fct_interchange_hourly+` (history sits outside the incremental window).
 
 ### NOAA daily ingestion
 
@@ -225,11 +260,11 @@ The contracts (function name, table, grain, units) are in [CLAUDE.md](CLAUDE.md)
 
 - **Worker detail:** image in ECR repo `zeus-dev-dbt-run`, tag = commit SHA, built + deployed by CI on merge to dev (Phase 2.5); the Terraform root provisions the Lambda/ECR but ignores `image_uri`; 2048 MB, 300 s. The image bakes `transform/` + `dbt deps` at build time; the handler runs `dbt build` (models + tests) via `dbtRunner`, authenticating as `ZEUS_DEV_TRANSFORMER` (key-pair; private key SSM `/zeus/dev/snowflake/transformer_private_key`, fetched to `/tmp` per run).
 - **Lambda runtime gotchas (isolated in `src/lambdas/dbt/lambda_mp_patch.py`, rationale in its docstring; the handler calls `apply()`):** Lambda has **no `/dev/shm`**, so multiprocessing SemLocks raise `FileNotFoundError` — `apply()` swaps dbt's mp context for `multiprocessing.dummy` **before** the `dbt.cli` import (Manifest binds the lock factory at class-definition time) and replaces ThreadPool's SemLock-backed change notifier with an `os.pipe()` shim. The image is read-only → `HOME` and dbt's target/log paths are redirected to `/tmp`.
-- **Observed performance:** ~47 s per run (21 models, 103 tests — includes the incremental merge over `fct_demand_hourly` and the accuracy/daily-mart rebuilds; July 2026 CD smoke-invoke). Image cold-start init ~3.1 s, peak memory ~298 MB (of 2048).
+- **Observed performance:** ~47 s per run at the pre-interchange scope (21 models, 103 tests; July 2026 CD smoke-invoke) — now 27 models + 1 seed, 129 tests (interchange staging/marts/views + `ba_centroids`); expect the duration to tick up at the next CD smoke-invoke. Image cold-start init ~3.1 s, peak memory ~298 MB (of 2048).
 
 ### Daily digest
 
-- **What it does (detail):** for each source in `SOURCES` (`eia,eia_region,noaa,fred`), reads today's `reports/<source>/.../run_report.json` from S3, computes a 30-day skip history, and publishes **one** combined email to `zeus-dev-alerts` (succeeded/skipped counts + Snowflake rows loaded per source). It also reads `reports/dbt/.../run_report.json` and renders it as its own section (subject chip like `dbt 21 models / 103 tests` or `dbt FAILED 2 tests`, body lists failed-test names). A source or dbt run that wrote no report (it crashed → the execution-level alert already fired) is surfaced as "no report", not a crash. Reuses `src/shared/report.py` (`format_digest`, `format_dbt_section`).
+- **What it does (detail):** for each source in `SOURCES` (`eia,eia_region,eia_interchange,noaa,fred`), reads today's `reports/<source>/.../run_report.json` from S3, computes a 30-day skip history, and publishes **one** combined email to `zeus-dev-alerts` (succeeded/skipped counts + Snowflake rows loaded per source). It also reads `reports/dbt/.../run_report.json` and renders it as its own section (subject chip like `dbt 27 models / 129 tests` or `dbt FAILED 2 tests`, body lists failed-test names). A source or dbt run that wrote no report (it crashed → the execution-level alert already fired) is surfaced as "no report", not a crash. Reuses `src/shared/report.py` (`format_digest`, `format_dbt_section`).
 - **SNS caps subjects at 100 ASCII chars** — the subject is deliberately static (`Zeus daily report — <date>`); all per-source/dbt detail lives in the body (per-source chips overflowed the cap at 3 sources).
 
 ### Public dashboard (Streamlit + governed serving layer)

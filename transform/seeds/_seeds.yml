@@ -1,0 +1,41 @@
+version: 2
+
+seeds:
+  - name: ba_centroids
+    description: >
+      Representative map coordinates for every physical balancing authority that
+      appears in the EIA interchange-data facets (fromba or toba) — including the
+      Canadian/Mexican counterparties that are never a fromba. Hand-curated
+      approximate footprint/operational centers (M-23): good enough to anchor
+      flow-map arcs, not survey data. EIA regional aggregates (US48, CAL, TEX,
+      CAN, MEX, ...) are deliberately absent — they are rollups of these rows and
+      would double-draw physical flows on a map. Consumed by the dashboard via
+      vw_ba_centroids (joined in pandas against both arc ends, M-23) — never
+      joined into the marts, so reporting views stay 1:1 (M-13).
+    columns:
+      - name: ba
+        description: Balancing-authority code (EIA facet id).
+        data_tests: [unique, not_null]
+      - name: ba_name
+        description: Human-readable balancing-authority name (EIA facet name).
+        data_tests: [not_null]
+      - name: latitude
+        description: Representative latitude, decimal degrees (WGS84).
+        # Tight North-America bounds — a typo'd coordinate should FAIL the build,
+        # not draw an arc into the ocean.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 24
+                max_value: 60
+                inclusive: true
+      - name: longitude
+        description: Representative longitude, decimal degrees (WGS84, negative = west).
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -135
+                max_value: -60
+                inclusive: true

@@ -393,6 +393,21 @@ rows = [normalize_row(r, today)
 
 ---
 
+## 19. Shared EIA API client: `src/shared/eia_api.py` (rule of three)
+
+**Chosen:** with the third EIA-family source (`eia_interchange`), the paginated fetch loop that had been copied byte-for-byte between the `eia` and `eia_region` clients moved into `src/shared/eia_api.py`: `fetch_page`/`fetch_unit` parameterized by exactly the two axes that differ across routes — the **route URL** and the **facet name** (`respondent` vs `fromba`). The three `client.py` files became thin wrappers that bind those two constants, **keeping their public signatures unchanged** (`fetch_unit(unit, start, end, api_key)`, module-level `BASE_URL`), so the handlers and the backfills' 429-aware `fetch.py` wrappers needed zero edits. `PAGE_SIZE = 5000`, the 502/503/504 backoff, the offset pagination against the API's `total`, and the politeness sleep are shared verbatim; a `tests/shared/test_eia_api.py` unit suite pins the pagination, retry, and raise-on-429 behaviour with a stubbed `requests`.
+
+**Alternatives considered:**
+- **A third copy.** The first two copies were a deliberate wait for the rule of three (recorded as the trigger in the tech-debt notes and EIA-REGION-3); a third identical copy is past the line where duplication stops being cheap insurance and starts being drift risk.
+- **Extracting at the second source.** Rejected then: two points don't show which axes actually vary. The third source proved it's exactly URL + facet — the abstraction wrote itself.
+- **Parameterizing more (frequency, data columns, retry policy).** Not needed by any current route; speculative knobs violate the build-for-now rule.
+
+**Why:** three byte-identical 40-line files, differing in one constant, is the textbook extraction trigger; the wrapper pattern keeps each source's contract exactly where the scaffold skill expects it.
+
+**Trade-offs:** a shared module widens blast radius — a bug in `eia_api.py` breaks three ingests at once. Mitigated by the unit suite and by the build fingerprint: **any `src/shared/` change re-fingerprints every zip Lambda's build, so touching `eia_api.py` means re-applying the `eia`, `eia_region`, and `eia_interchange` roots together** (and expect the dbt-image CD to fire on merge, since it watches `src/shared/**`).
+
+---
+
 # Pipeline-specific decisions
 
 ## EIA pipeline
@@ -588,6 +603,36 @@ Pulls the EIA v2 RTO `region-data` route — hourly **Demand (D)**, **Day-ahead 
 
 ---
 
+## EIA interchange-data pipeline
+
+Pulls the EIA v2 RTO `interchange-data` route — hourly **BA-to-BA power flows**, signed (positive = `fromba` exports to `toba`) — as the platform's fifth source (`eia_interchange`), landing in `ZEUS_DEV.EIA_INTERCHANGE.EIA_INTERCHANGE_GRID`. Same API, key, and pipeline shape as the other EIA sources (its client is a wrapper over the shared `eia_api.py`, decision 19); only the genuinely source-specific decisions are recorded here. History floor 2019-01-01 (route `startPeriod`, verified via route metadata 2026-07-12 — same floor as region-data). Downstream modeling decisions (directed grain, asymmetry test, net position, centroids seed) are M-21..M-23 in `transform/DECISIONS.md`.
+
+### EIA-INTERCHANGE-1. Fan-out on `fromba` only; both directions land deliberately
+
+**Chosen:** the fan-out unit is the reporting BA (`facets[fromba][]`); one request-loop per BA returns flows to **all** of that BA's neighbors. The mirrored `toba → fromba` rows arrive via the neighbor's own fan-out unit, so every pair inside the fan-out list lands **twice — once per reporter — and that is the point**: the two BAs' independent reports of the same physical flow are what the `interchange_asymmetry` test compares (M-22). Grain `(period, fromba, toba)`, signed MWh, mirroring the raw API shape.
+
+**Alternatives considered:**
+- **Fan-out on `(fromba, toba)` pairs** — hundreds of units for no isolation gain (a BA's neighbors come from one endpoint and fail together) and a broken 1-unit-=-1-raw-file convention.
+- **Deduping the mirrored rows at ingestion** — destroys the second report, which is the analytical asset; also forces a "which reporter wins" judgment into a Lambda (landing mirrors truth-as-received, always).
+
+**Why:** per-unit fault tolerance stays per-BA; volume is modest (neighbors ≈ 2–8 per BA — the full-history backfill is ~25M rows vs fuel-type's similar scale for one route).
+
+### EIA-INTERCHANGE-2. Fan-out list = the full 81-code `fromba` facet, aggregates included
+
+**Chosen:** the unit list is the eia/eia_region 71-BA list **plus the 10 fromba codes that list had pruned** (`AEC, EEI, GLHB, GRIF, HGMA, NSB, SPA, WACM, WAUW, WWA`) — full coverage of the route's `fromba` facet. That old pruning was a *generation*-emptiness judgment (EIA-7) that doesn't transfer: these BAs report real interchange, and since flow visuals draw each BA's own positive reports, omitting them made every flow **they** export invisible. Several are historical (EEI was absorbed by GridLiance ~2020; only WACM still reports currently) — they matter precisely for the 2019→ history. The EIA **regional aggregates** (US48, CAL, TEX, …) also report interchange and are **kept**: landing stays complete (the US48 precedent from region-data), and — verified empirically 2026-07-12 — aggregates pair only with other aggregates (and CAN/MEX), never with physical BAs, so the physical/aggregate layers never mix. Consumers wanting physical flows semi-join the `ba_centroids` seed, which doubles as the physical-BA registry (M-23). `PSCO` reported continuously 2019 → late March 2026 and then went dark — left in the list (an empty unit is a logged skip, not a failure, and the daily skip is precisely how a live reporting lapse stays visible).
+
+**Alternatives considered:**
+- **Reusing the 71-BA list as-is** (the roadmap draft) — shipped for the first smoke, then corrected the same day when the flow map showed the gap.
+- **Pruning the aggregates** — cleaner marts for free, but landing would no longer mirror the route, the aggregate national/regional cross-border series (US48→CAN) would be silently absent, and one day of aggregate rows had already landed (append-only). Filtering at consumption is one semi-join.
+
+**Why:** the fan-out list is this route's own judgment (the deliberate-duplication rationale of EIA-REGION-3, exercised in the opposite direction).
+
+### EIA-INTERCHANGE-3. Shared EIA API key, third consumer
+
+**Chosen:** same single-Terraform-owner pattern as EIA-REGION-3 — the `eia` root owns `/zeus/dev/eia/api_key`; this root consumes the path string. Rate budget re-checked at the third consumer: all three EIA Lambdas run in the same Parallel state against one key, combined ~215 requests/run vs the published 5,000/hr default — still comfortable. Backfills self-throttle (429-aware `fetch.py`) and run outside the cron window.
+
+---
+
 ## NOAA pipeline
 
 Pulls daily weather summaries from NOAA NCEI (`access/services/data/v1`, `daily-summaries`) for weather stations grouped under 14 balancing authorities (`CISO, PJM, ERCO, MISO, ISNE, NYIS, SWPP, TVA, SOCO, DUK, FPL, BPAT, PSCO, SRP`; 3–10 stations each), daily. Mirrors the EIA pipeline's shape; only the genuinely source-specific decisions are recorded here.
@@ -686,7 +731,7 @@ Pulls 15 national energy price series from the St. Louis Fed's FRED API (`fred/s
 
 ## dbt pipeline
 
-Runs `dbt build` (staging + intermediate + marts models and their tests — 21 models, 103 tests) over `transform/` against `ZEUS_DEV`, daily, as the `Dbt` step of the state machine (decision 14) — between the ingest Parallel and the digest.
+Runs `dbt build` (staging + intermediate + marts + reporting models, the seed, and their tests — 27 models, 129 tests) over `transform/` against `ZEUS_DEV`, daily, as the `Dbt` step of the state machine (decision 14) — between the ingest Parallel and the digest.
 
 ### DBT-1. Runner: a container-image Lambda
 
@@ -698,7 +743,7 @@ Runs `dbt build` (staging + intermediate + marts models and their tests — 21 m
 - **dbt Cloud** — managed scheduler/runner; a paid service and a second orchestrator when the state machine already owns the DAG.
 
 **Why:**
-- The whole daily build is well under a minute (21 models, 103 tests — duration detail in RUNBOOK) — squarely a Lambda-sized job; the 300 s timeout and 2048 MB leave generous headroom (memory detail in RUNBOOK).
+- The whole daily build is well under a minute (27 models, 129 tests — duration detail in RUNBOOK) — squarely a Lambda-sized job; the 300 s timeout and 2048 MB leave generous headroom (memory detail in RUNBOOK).
 - The state machine needs one more `lambda:invoke` step — dbt gets the exact same retry/catch/alert semantics as the ingests.
 - Image cold-start (a few seconds) is irrelevant for a daily batch.
 
@@ -708,7 +753,7 @@ Runs `dbt build` (staging + intermediate + marts models and their tests — 21 m
 
 ### DBT-2. Report-before-raise: the dbt run report feeds the digest
 
-**Chosen:** The handler summarizes the `dbtRunner` result (models built, tests passed/failed, failed-test **names**) and writes `reports/dbt/.../run_report.json` — same reports-layer layout as the ingests, with `source = dbt` — **before** raising on failure. The digest reads it alongside the source reports and renders dbt as its own section (subject chip `dbt 21 models / 103 tests` or `dbt FAILED 2 tests`; body lists the failed tests). dbt is **not** added to `SOURCES` (`eia,noaa,fred`) — it has no fan-out units, so it renders as a standalone section, not a per-source one.
+**Chosen:** The handler summarizes the `dbtRunner` result (models built, tests passed/failed, failed-test **names**) and writes `reports/dbt/.../run_report.json` — same reports-layer layout as the ingests, with `source = dbt` — **before** raising on failure. The digest reads it alongside the source reports and renders dbt as its own section (subject chip `dbt 27 models / 129 tests` or `dbt FAILED 2 tests`; body lists the failed tests). dbt is **not** added to `SOURCES` — it has no fan-out units, so it renders as a standalone section, not a per-source one.
 
 **Why:**
 - A failing dbt test day produces a digest email that says **which** tests failed, plus the execution-level SNS alert (decision 8). Writing the report before raising is what guarantees the digest has the detail even on failure days; "dbt: no report" then only means dbt crashed before finishing.
